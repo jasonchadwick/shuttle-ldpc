@@ -1,0 +1,6 @@
+[submodule "extern/spin_qec"]
+	path = extern/spin_qec
+	url = git@github.com:jasonchadwick/spin-QEC.git
+[submodule "extern/mapf"]
+	path = extern/mapf
+	url = git@github.com:gloriyo/MAPF-ICBS.git
