@@ -62,6 +62,14 @@ class Instruction:
     error: float
     kwargs: dict[str, Any] = field(default_factory=dict)
 
+class SpinBusDevice:
+    def __init__(self) -> None:
+        raise NotImplementedError
+
+################################################################################
+# below is old code
+################################################################################
+
 class EdgeType(Enum):
     DOT = 0
     QUBIT = 1
