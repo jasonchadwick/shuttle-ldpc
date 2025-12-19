@@ -64,3 +64,33 @@ class QECCode:
         assert not any(np.sum(Hx, axis=1) == 0), "Stabilizer matrix has empty rows"
         assert not any(np.sum(Hx, axis=0) == 0), "Stabilizer matrix has empty columns"
         return Hx
+    
+class TestCode(QECCode):
+    # Data qubits are in a grid, X checks are along cols, Z checks are along
+    # rows. Doesn't correspond to any actual QEC code, just for testing
+    # scheduling
+    def __init__(self, w, h):
+        self.w = w
+        self.h = h
+        self.num_data = w*h
+        self.data_indices = list(range(self.num_data))
+        self.data_coords = [(i%w, i//w) for i in self.data_indices]
+        self.data_coord_to_idx = {c:i for i,c in zip(self.data_indices, self.data_coords)}
+        self.X_ancilla_indices = []
+        self.X_checks = []
+        self.Z_ancilla_indices = []
+        self.Z_checks = []
+
+    def add_all_checks(self):
+        self.X_ancilla_indices = list(range(self.num_data, self.num_data + self.w))
+        self.X_checks = [[self.data_coord_to_idx[(x,y)] for y in range(self.h)] for x in range(self.w)]
+        self.Z_ancilla_indices = list(range(self.num_data + self.w, self.num_data + self.w + self.h))
+        self.Z_checks = [[self.data_coord_to_idx[(x,y)] for x in range(self.w)] for y in range(self.h)]
+
+    def add_row_check(self, y: int):
+        self.Z_ancilla_indices.append(self.num_data + len(self.Z_ancilla_indices) + len(self.X_ancilla_indices))
+        self.Z_checks.append([self.data_coord_to_idx[(x,y)] for x in range(self.w)])
+    
+    def add_col_check(self, x: int):
+        self.X_ancilla_indices.append(self.num_data + len(self.Z_ancilla_indices) + len(self.X_ancilla_indices))
+        self.X_checks.append([self.data_coord_to_idx[(x,y)] for y in range(self.h)])
