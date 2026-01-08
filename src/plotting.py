@@ -38,8 +38,8 @@ def plot_device_snapshot(
         for y in range(dev.h):
             ax.add_patch(mpl.patches.Rectangle((x-1+0.05, y-1+0.05), 0.9, 0.9, facecolor='w', edgecolor='none', zorder=0.5))
             if x < dev.w and y < dev.h:
-                ax.add_patch(mpl.patches.Rectangle((x-0.5, y-0.25), 0.2, 0.2, facecolor='orange', edgecolor='k', zorder=0.5))
-                ax.add_patch(mpl.patches.Rectangle((x-0.25, y-0.45), 0.2, 0.4, facecolor='green', edgecolor='k', zorder=0.5))
+                ax.add_patch(mpl.patches.Rectangle((x-0.5, y-0.25), 0.2, 0.2, facecolor='C2', edgecolor='none', zorder=0.5))
+                ax.add_patch(mpl.patches.Rectangle((x-0.25, y-0.45), 0.2, 0.4, facecolor='C3', edgecolor='none', zorder=0.5))
     
     for q,coords in frame.qubit_positions.items():
         color = get_q_color(q, code)
