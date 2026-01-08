@@ -116,7 +116,6 @@ class HGPCode(QECCode):
                 # counters[color] += num_colors
                 # if color + counters[color] >= target_num_colors:
                     # counters[color] = 0
-            print(num_colors)
 
             if any(len(layer) == 0 for layer in layers):
                 print(f"WARNING: {sum(len(layer)==0 for layer in layers)}/{len(layers)} layers are empty")
@@ -217,12 +216,11 @@ class HGPCode(QECCode):
                 if self.pretty_print_logical_ops:
                     print(f'X: [0]^{zero_length}(+){x1}(x){x2}')
 
-        logical_X = np.array(logical_X).T
-        logical_Z = np.array(logical_Z).T
+        logical_X = np.array(logical_X)
+        logical_Z = np.array(logical_Z)
 
-
-        assert (self.Hx@logical_Z%2).max() == 0, "Logical Z is not in ker(Hx)"
-        assert (self.Hz@logical_X%2).max() == 0, "Logical X is not in ker(Hz)"
+        assert (self.Hx@logical_Z.T%2).max() == 0, "Logical Z is not in ker(Hx)"
+        assert (self.Hz@logical_X.T%2).max() == 0, "Logical X is not in ker(Hz)"
         
         return logical_X, logical_Z
 

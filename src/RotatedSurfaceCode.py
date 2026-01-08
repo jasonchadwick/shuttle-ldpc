@@ -5,6 +5,7 @@ from math import ceil, floor
 from numpy.typing import NDArray
 import stim
 from src.QECCode import QECCode
+import src.device as device
 
 class Qubit():
     """A single physical qubit on a device.
@@ -162,13 +163,13 @@ class RotatedSurfaceCode(QECCode):
                     q_count += 1
 
     def compute_logical_operators(self) -> tuple[NDArray[np.int_], NDArray[np.int_]]:
-        logical_X = np.zeros((self.num_data, 1), dtype=np.int_)
-        logical_Z = np.zeros((self.num_data, 1), dtype=np.int_)
+        logical_X = np.zeros((1, self.num_data), dtype=np.int_)
+        logical_Z = np.zeros((1, self.num_data), dtype=np.int_)
         for q in self.data:
             if q.coords[0] == min(q1.coords[0] for q1 in self.data):
-                logical_X[q.idx] = 1
+                logical_X[0, q.idx] = 1
             if q.coords[1] ==  min(q1.coords[1] for q1 in self.data):
-                logical_Z[q.idx] = 1
+                logical_Z[0, q.idx] = 1
         return logical_X, logical_Z
 
     def compute_code_parameters(self):
@@ -267,3 +268,215 @@ class RotatedSurfaceCode(QECCode):
             circ.append('OBSERVABLE_INCLUDE', [stim.target_rec(meas_rec[q][-1]) for q in self.data_indices if obs[q]], i)
 
         return circ
+    
+    def get_schedule(self, hwp: device.HardwareParams, rounds: int = 1) -> device.CompiledShuttlingSchedule:
+        schedule = device.CompiledShuttlingSchedule([q.idx for q in self.all_qubits], self.data_indices)
+
+        # Initialize
+        data_init_coords = {q:((x+1)//2, (y+1)//2) for q,(x,y) in [(q,self.qubit_coords[q]) for q in self.data_indices]}
+        anc_init_coords = {q:((x+2)//2, (y+2)//2) for q,(x,y) in [(q,self.qubit_coords[q]) for q in self.X_ancilla_indices + self.Z_ancilla_indices]}
+        schedule.append_instr(
+            device.Instantiate(
+                hwp.init_duration,
+                schedule.data_qubits,
+                [data_init_coords[q] for q in schedule.data_qubits],
+            ),
+            0,
+        )
+        for data in schedule.data_qubits:
+            schedule.append_instr(
+                device.EmplaceDisplace(
+                    hwp.emplace_duration,
+                    data,
+                    data_init_coords[data],
+                    device.DeviceComponent.READOUT,
+                    device.DeviceComponent.INTERACTION_ZONE,
+                ),
+                hwp.init_duration,
+            )
+
+        def do_check(
+                anc_idx: int,
+                data: DataQubit,
+                cur_anc_coords: tuple[int, int],
+                t_start: int,
+                start_anc_component: device.DeviceComponent = device.DeviceComponent.SHUTTLE_INTERSECTION,
+                end_anc_component: device.DeviceComponent = device.DeviceComponent.SHUTTLE_INTERSECTION,
+            ):
+            data_idx = data.idx
+            data_coords = data_init_coords[data_idx]
+            assert cur_anc_coords == data_coords
+            schedule.append_instr(device.EmplaceDisplace(
+                hwp.emplace_duration,
+                anc_idx,
+                data_coords,
+                start_anc_component,
+                device.DeviceComponent.INTERACTION_ZONE,
+            ), t_start)
+            schedule.append_instr(device.Gate(
+                hwp.cx_duration,
+                [anc_idx, data_idx] if anc_idx in self.X_ancilla_indices else [data_idx, anc_idx],
+                device.GateName.CX,
+            ), t_start + hwp.emplace_duration)
+            schedule.append_instr(device.EmplaceDisplace(
+                hwp.emplace_duration,
+                anc_idx,
+                data_coords,
+                device.DeviceComponent.INTERACTION_ZONE,
+                end_anc_component,
+            ), t_start + hwp.emplace_duration + hwp.cx_duration)
+            t_end = t_start + 2*hwp.emplace_duration + hwp.cx_duration
+            return t_end
+
+        anc_indices = self.X_ancilla_indices + self.Z_ancilla_indices
+        for round_idx in range(rounds):
+            schedule.append_instr(
+                device.Instantiate(
+                    hwp.init_duration,
+                    anc_indices,
+                    [anc_init_coords[anc] for anc in anc_indices],
+                ),
+                schedule.total_duration()
+            )
+            schedule.append_instr(device.Gate(
+                hwp.h_duration,
+                self.X_ancilla_indices,
+                device.GateName.H, 
+            ), schedule.total_duration())
+            t1 = schedule.total_duration()
+            if round_idx == 0:
+                assert t1 == 2*hwp.init_duration + hwp.emplace_duration + hwp.h_duration, (t1, 2*hwp.init_duration + hwp.emplace_duration + hwp.h_duration)
+            t2 = t1 + 2*hwp.emplace_duration + hwp.cx_duration + hwp.shuttle_duration
+            t3 = t2 + 2*hwp.emplace_duration + hwp.cx_duration + 2*hwp.shuttle_duration
+            t4 = t3 + 2*hwp.emplace_duration + hwp.cx_duration + hwp.shuttle_duration
+
+            # Syndrome measurement
+            final_anc_coords: dict[int, tuple[int, int]] = dict()
+            for ai,anc in enumerate(anc_indices):
+                cur_anc_coords = anc_init_coords[anc]
+                if anc in self.X_ancilla_indices:
+                    checked_data = self.x_ancilla[ai].data_qubits
+                else:
+                    checked_data = self.z_ancilla[ai - len(self.X_ancilla_indices)].data_qubits
+
+                # First check
+                if checked_data[0]:
+                    t_end = do_check(
+                        anc,
+                        checked_data[0],
+                        cur_anc_coords,
+                        t1,
+                        start_anc_component=device.DeviceComponent.READOUT,
+                    )
+                    assert t_end == t2 - hwp.shuttle_duration
+                else:
+                    schedule.append_instr(device.EmplaceDisplace(
+                        hwp.emplace_duration,
+                        anc,
+                        cur_anc_coords,
+                        device.DeviceComponent.READOUT,
+                        device.DeviceComponent.SHUTTLE_INTERSECTION,
+                    ), t1)
+                
+                # Shuttle
+                if anc in self.X_ancilla_indices:
+                    dx,dy = -1,0
+                else:
+                    dx,dy = 0,-1
+                schedule.append_instr(device.Shuttle(
+                    hwp.shuttle_duration,
+                    anc,
+                    cur_anc_coords,
+                    (cur_anc_coords[0]+dx, cur_anc_coords[1]+dy),
+                ), t2 - hwp.shuttle_duration)
+                cur_anc_coords = (cur_anc_coords[0]+dx, cur_anc_coords[1]+dy)
+
+                # Second check
+                if checked_data[1]:
+                    t_end = do_check(
+                        anc,
+                        checked_data[1],
+                        cur_anc_coords,
+                        t2,
+                    )
+                
+                # Shuttle
+                if anc in self.X_ancilla_indices:
+                    shuttles = [(0,-1), (1,0)]
+                else:
+                    shuttles = [(-1,0), (0,1)]
+                for i,(dx,dy) in enumerate(shuttles):
+                    schedule.append_instr(device.Shuttle(
+                        hwp.shuttle_duration,
+                        anc,
+                        cur_anc_coords,
+                        (cur_anc_coords[0]+dx, cur_anc_coords[1]+dy),
+                    ), t3 - (len(shuttles)-i)*hwp.shuttle_duration)
+                    cur_anc_coords = (cur_anc_coords[0]+dx, cur_anc_coords[1]+dy)
+
+                # Third check
+                if checked_data[2]:
+                    t_end = do_check(
+                        anc,
+                        checked_data[2],
+                        cur_anc_coords,
+                        t3,
+                    )
+                
+                # Shuttle
+                if anc in self.X_ancilla_indices:
+                    dx,dy = -1,0
+                else:
+                    dx,dy = 0,-1
+                schedule.append_instr(device.Shuttle(
+                    hwp.shuttle_duration,
+                    anc,
+                    cur_anc_coords,
+                    (cur_anc_coords[0]+dx, cur_anc_coords[1]+dy),
+                ), t4 - hwp.shuttle_duration)
+                cur_anc_coords = (cur_anc_coords[0]+dx, cur_anc_coords[1]+dy)
+
+                # Fourth check
+                if checked_data[3]:
+                    t_end = do_check(
+                        anc,
+                        checked_data[3],
+                        cur_anc_coords,
+                        t4,
+                        end_anc_component=device.DeviceComponent.READOUT,
+                    )
+                final_anc_coords[anc] = cur_anc_coords
+            schedule.append_instr(device.Gate(
+                hwp.h_duration,
+                self.X_ancilla_indices,
+                device.GateName.H, 
+            ), t4 + hwp.cx_duration + hwp.emplace_duration)
+            schedule.append_instr(device.Measure(
+                hwp.measure_duration,
+                anc_indices,
+                [final_anc_coords[anc] for anc in anc_indices],
+            ), t4 + hwp.cx_duration + hwp.emplace_duration + hwp.h_duration)
+
+        # Measure data
+        t_meas = schedule.total_duration()
+        for data in schedule.data_qubits:
+            schedule.append_instr(
+                device.EmplaceDisplace(
+                    hwp.emplace_duration,
+                    data,
+                    data_init_coords[data],
+                    device.DeviceComponent.INTERACTION_ZONE,
+                    device.DeviceComponent.READOUT,
+                ),
+                t_meas
+            )
+        schedule.append_instr(
+            device.Measure(
+                hwp.init_duration,
+                schedule.data_qubits,
+                [data_init_coords[q] for q in schedule.data_qubits],
+            ),
+            schedule.total_duration()
+        )
+        
+        return schedule
