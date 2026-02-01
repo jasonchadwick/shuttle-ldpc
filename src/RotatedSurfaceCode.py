@@ -269,7 +269,15 @@ class RotatedSurfaceCode(QECCode):
 
         return circ
     
-    def get_schedule(self, hwp: device.HardwareParams, rounds: int = 1) -> device.CompiledShuttlingSchedule:
+    def get_schedule(
+            self,
+            hwp: device.HardwareParams,
+            basis: str,
+            rounds: int = 1,
+            refocus_shuttling_noise: bool = False,
+        ) -> device.CompiledShuttlingSchedule:
+        assert basis in ['X', 'Z']
+
         schedule = device.CompiledShuttlingSchedule([q.idx for q in self.all_qubits], self.data_indices)
 
         # Initialize
@@ -283,6 +291,15 @@ class RotatedSurfaceCode(QECCode):
             ),
             0,
         )
+        if basis == 'X':
+            schedule.append_instr(
+                device.Gate(
+                    hwp.h_duration,
+                    schedule.data_qubits,
+                    device.GateName.H,
+                ), schedule.total_duration()
+            )
+        t = schedule.total_duration()
         for data in schedule.data_qubits:
             schedule.append_instr(
                 device.EmplaceDisplace(
@@ -292,7 +309,7 @@ class RotatedSurfaceCode(QECCode):
                     device.DeviceComponent.READOUT,
                     device.DeviceComponent.INTERACTION_ZONE,
                 ),
-                hwp.init_duration,
+                t,
             )
 
         def do_check(
@@ -302,6 +319,8 @@ class RotatedSurfaceCode(QECCode):
                 t_start: int,
                 start_anc_component: device.DeviceComponent = device.DeviceComponent.SHUTTLE_INTERSECTION,
                 end_anc_component: device.DeviceComponent = device.DeviceComponent.SHUTTLE_INTERSECTION,
+                first_check: bool = False,
+                last_check: bool = False,
             ):
             data_idx = data.idx
             data_coords = data_init_coords[data_idx]
@@ -313,19 +332,37 @@ class RotatedSurfaceCode(QECCode):
                 start_anc_component,
                 device.DeviceComponent.INTERACTION_ZONE,
             ), t_start)
+            t_cx = t_start + hwp.emplace_duration
+            if refocus_shuttling_noise and not first_check:
+                if anc_idx in self.Z_ancilla_indices:
+                    schedule.append_instr(device.Gate(
+                        hwp.h_duration,
+                        [anc_idx],
+                        device.GateName.H,
+                    ), t_cx)
+                t_cx += hwp.h_duration
             schedule.append_instr(device.Gate(
                 hwp.cx_duration,
                 [anc_idx, data_idx] if anc_idx in self.X_ancilla_indices else [data_idx, anc_idx],
                 device.GateName.CX,
-            ), t_start + hwp.emplace_duration)
+            ), t_cx)
+            t_leave = t_cx + hwp.cx_duration
+            if refocus_shuttling_noise and not last_check:
+                if anc_idx in self.Z_ancilla_indices:
+                    schedule.append_instr(device.Gate(
+                        hwp.h_duration,
+                        [anc_idx],
+                        device.GateName.H,
+                    ), t_leave)
+                t_leave += hwp.h_duration
             schedule.append_instr(device.EmplaceDisplace(
                 hwp.emplace_duration,
                 anc_idx,
                 data_coords,
                 device.DeviceComponent.INTERACTION_ZONE,
                 end_anc_component,
-            ), t_start + hwp.emplace_duration + hwp.cx_duration)
-            t_end = t_start + 2*hwp.emplace_duration + hwp.cx_duration
+            ), t_leave)
+            t_end = t_leave + hwp.emplace_duration
             return t_end
 
         anc_indices = self.X_ancilla_indices + self.Z_ancilla_indices
@@ -343,12 +380,20 @@ class RotatedSurfaceCode(QECCode):
                 self.X_ancilla_indices,
                 device.GateName.H, 
             ), schedule.total_duration())
+
+            # ti: time we start check i
             t1 = schedule.total_duration()
             if round_idx == 0:
-                assert t1 == 2*hwp.init_duration + hwp.emplace_duration + hwp.h_duration, (t1, 2*hwp.init_duration + hwp.emplace_duration + hwp.h_duration)
+                assert t1 == 2*hwp.init_duration + hwp.emplace_duration + hwp.h_duration + (0 if basis == 'Z' else hwp.h_duration), (t1, 2*hwp.init_duration + hwp.emplace_duration + hwp.h_duration)
             t2 = t1 + 2*hwp.emplace_duration + hwp.cx_duration + hwp.shuttle_duration
             t3 = t2 + 2*hwp.emplace_duration + hwp.cx_duration + 2*hwp.shuttle_duration
             t4 = t3 + 2*hwp.emplace_duration + hwp.cx_duration + hwp.shuttle_duration
+            t_end = t4 + 2*hwp.emplace_duration + hwp.cx_duration
+            if refocus_shuttling_noise:
+                t2 += hwp.h_duration
+                t3 += 3*hwp.h_duration
+                t4 += 5*hwp.h_duration
+                t_end += 6*hwp.h_duration
 
             # Syndrome measurement
             final_anc_coords: dict[int, tuple[int, int]] = dict()
@@ -361,14 +406,15 @@ class RotatedSurfaceCode(QECCode):
 
                 # First check
                 if checked_data[0]:
-                    t_end = do_check(
+                    t = do_check(
                         anc,
                         checked_data[0],
                         cur_anc_coords,
                         t1,
                         start_anc_component=device.DeviceComponent.READOUT,
+                        first_check=True,
                     )
-                    assert t_end == t2 - hwp.shuttle_duration
+                    assert t == t2 - hwp.shuttle_duration, (t, t2)
                 else:
                     schedule.append_instr(device.EmplaceDisplace(
                         hwp.emplace_duration,
@@ -393,11 +439,13 @@ class RotatedSurfaceCode(QECCode):
 
                 # Second check
                 if checked_data[1]:
-                    t_end = do_check(
+                    t = do_check(
                         anc,
                         checked_data[1],
                         cur_anc_coords,
                         t2,
+                        first_check=not checked_data[0],
+                        last_check=(not checked_data[2] and not checked_data[3]),
                     )
                 
                 # Shuttle
@@ -416,11 +464,13 @@ class RotatedSurfaceCode(QECCode):
 
                 # Third check
                 if checked_data[2]:
-                    t_end = do_check(
+                    t = do_check(
                         anc,
                         checked_data[2],
                         cur_anc_coords,
                         t3,
+                        first_check=(not checked_data[0] and not checked_data[1]),
+                        last_check=(not checked_data[3]),
                     )
                 
                 # Shuttle
@@ -438,27 +488,29 @@ class RotatedSurfaceCode(QECCode):
 
                 # Fourth check
                 if checked_data[3]:
-                    t_end = do_check(
+                    t = do_check(
                         anc,
                         checked_data[3],
                         cur_anc_coords,
                         t4,
                         end_anc_component=device.DeviceComponent.READOUT,
+                        last_check=True,
                     )
+                    assert t == t_end
                 final_anc_coords[anc] = cur_anc_coords
             schedule.append_instr(device.Gate(
                 hwp.h_duration,
                 self.X_ancilla_indices,
                 device.GateName.H, 
-            ), t4 + hwp.cx_duration + hwp.emplace_duration)
+            ), t_end)
             schedule.append_instr(device.Measure(
                 hwp.measure_duration,
                 anc_indices,
                 [final_anc_coords[anc] for anc in anc_indices],
-            ), t4 + hwp.cx_duration + hwp.emplace_duration + hwp.h_duration)
+            ), t_end + hwp.h_duration)
 
         # Measure data
-        t_meas = schedule.total_duration()
+        t = schedule.total_duration()
         for data in schedule.data_qubits:
             schedule.append_instr(
                 device.EmplaceDisplace(
@@ -468,7 +520,15 @@ class RotatedSurfaceCode(QECCode):
                     device.DeviceComponent.INTERACTION_ZONE,
                     device.DeviceComponent.READOUT,
                 ),
-                t_meas
+                t
+            )
+        if basis == 'X':
+            schedule.append_instr(
+                device.Gate(
+                    hwp.h_duration,
+                    schedule.data_qubits,
+                    device.GateName.H,
+                ), schedule.total_duration()
             )
         schedule.append_instr(
             device.Measure(

@@ -204,12 +204,12 @@ class CompiledShuttlingSchedule:
         return t_tot
 
     def __add__(self, other):
+        offset = self.total_duration()
         if isinstance(other, self.__class__):
             new_sched = CompiledShuttlingSchedule(list(sorted(set(self.qubits) | set(other.qubits))), list(sorted(set(self.data_qubits) | set(other.data_qubits))))
             for instr, t in zip(self.instructions, self.instruction_start_times):
                 new_sched.append_instr(instr, t)
             for instr, t in zip(other.instructions, other.instruction_start_times):
-                offset = self.total_duration()
                 new_sched.append_instr(instr, t + offset)
             return new_sched
         else:
@@ -339,9 +339,12 @@ class CompiledShuttlingSchedule:
         instrs_sort = np.argsort(self.instruction_start_times)
         instructions = [self.instructions[i] for i in instrs_sort]
         instruction_start_times = [self.instruction_start_times[i] for i in instrs_sort]
-        for instr, start_time in zip(instructions, instruction_start_times):
+        last_start_time = 0
+        init_basis_change = False
+        meas_basis_change = False
+        for instr_idx, (instr, start_time) in enumerate(zip(instructions, instruction_start_times)):
             # apply idle errors
-            if not isinstance(instr, Instantiate):
+            if not isinstance(instr, Instantiate) and start_time > last_start_time:
                 idle_ops: dict[float, list[int]] = dict()
                 for q in instr.qubits_list():
                     if qubit_time_last_used[q] < start_time:
@@ -350,6 +353,123 @@ class CompiledShuttlingSchedule:
                         idle_ops.setdefault(idle_err, []).append(q)
                 for idle_err, qs in idle_ops.items():
                     circ.append('Z_ERROR', qs, min(0.75, idle_err))
+                last_start_time = start_time
+
+            # apply instruction
+            if isinstance(instr, Gate):
+                if instr.name == GateName.CX:
+                    circ.append('CX', instr.qubits, ())
+                    circ.append('DEPOLARIZE2', instr.qubits, min(15/16, error_params.cx_err))
+                elif instr.name == GateName.H:
+                    circ.append('H', instr.qubits, ())
+                    circ.append('DEPOLARIZE1', instr.qubits, min(0.75, error_params.h_err))
+                else:
+                    raise NotImplementedError
+            elif isinstance(instr, Instantiate):
+                circ.append('R', instr.qubits, ())
+                circ.append('X_ERROR', instr.qubits, error_params.init_err)
+                if instr_idx == 0:
+                    if basis == 'X' and set(instr.qubits) == set(code.data_indices):
+                        instr0 = self.instructions[self.instructions_by_qubit[code.data_indices[0]][0]]
+                        instr1 = self.instructions[self.instructions_by_qubit[code.data_indices[0]][1]]
+                        assert instr0 == instr
+                        if not (isinstance(instr1, Gate) and instr1.name == 'H'):
+                            init_basis_change = True
+                    if init_basis_change:
+                        print('Changing data qubit initialization to X basis...')
+                        circ.append('H', instr.qubits, ())
+                        circ.append('DEPOLARIZE1', instr.qubits, error_params.h_err)
+            elif isinstance(instr, Measure):
+                if instr_idx == len(self.instructions)-1:
+                    if basis == 'X' and set(instr.qubits) == set(code.data_indices):
+                        instr2 = self.instructions[self.instructions_by_qubit[code.data_indices[0]][-2]]
+                        instr1 = self.instructions[self.instructions_by_qubit[code.data_indices[0]][-1]]
+                        assert instr1 == instr
+                        if not (isinstance(instr2, Gate) and instr2.name == 'H'):
+                            meas_basis_change = True
+                    if meas_basis_change:
+                        print('Changing data qubit measurement to X basis...')
+                        circ.append('H', instr.qubits, ())
+                        circ.append('DEPOLARIZE1', instr.qubits, error_params.h_err)
+
+                circ.append('X_ERROR', instr.qubits, error_params.measure_err)
+                circ.append('M', instr.qubits)
+                for q in instr.qubits:
+                    meas_counter.setdefault(q, []).append(meas_count)
+                    meas_count += 1
+                # Add detectors if ancilla qubit
+                for q in instr.qubits:
+                    if q in code.X_ancilla_indices + code.Z_ancilla_indices:
+                        if len(meas_counter[q]) > 1:
+                            circ.append('DETECTOR', [stim.target_rec(meas_counter[q][-1] - meas_count), stim.target_rec(meas_counter[q][-2] - meas_count)], (q, len(meas_counter[q])-1))
+                        else:
+                            if (basis == 'X' and q in code.X_ancilla_indices) or (basis == 'Z' and q in code.Z_ancilla_indices):
+                                circ.append('DETECTOR', [stim.target_rec(meas_counter[q][-1] - meas_count)], (q, len(meas_counter[q])-1))
+            elif isinstance(instr, Shuttle):
+                circ.append('Z_ERROR', instr.qubit, error_params.shuttle_err)
+            elif isinstance(instr, EmplaceDisplace):
+                circ.append('Z_ERROR', instr.qubit, min(0.75, error_params.emplace_err))
+            else:
+                raise ValueError('Unsupported instruction:', instr)
+            
+            # update state
+            for q in instr.qubits_list():
+                qubit_time_last_used[q] = start_time + instr.duration
+                            
+        # Add final detectors
+        for q in meas_counter:
+            if basis == 'X' and q in code.X_ancilla_indices:
+                data_indices = code.X_checks[code.X_ancilla_indices.index(q)]
+            elif basis == 'Z' and q in code.Z_ancilla_indices:
+                data_indices = code.Z_checks[code.Z_ancilla_indices.index(q)]
+            else:
+                continue
+            circ.append('DETECTOR', [stim.target_rec(meas_counter[d][-1] - meas_count) for d in data_indices] + [stim.target_rec(meas_counter[q][-1] - meas_count)], (q, len(meas_counter[q])))
+        
+        # Add logical observables
+        Lx,Lz = code.compute_logical_operators()
+        assert Lx.shape[0] == code.compute_code_parameters()[1]
+        for i in range(Lx.shape[0]):
+            logicals = np.nonzero(Lx[i,:])[0] if basis == 'X' else np.nonzero(Lz[i,:])[0]
+            circ.append('OBSERVABLE_INCLUDE', [stim.target_rec(meas_counter[q][-1] - meas_count) for q in logicals], i)
+
+        assert (init_basis_change and meas_basis_change) or (not init_basis_change and not meas_basis_change)
+
+        return circ
+    
+    def to_stim_circuit_simple(self, code: QECCode, basis: str, error_params: ErrorParams) -> stim.Circuit:
+        """Convert the compiled shuttling schedule back into a Stim circuit."""
+        circ = stim.Circuit()
+
+        if hasattr(code, 'qubit_coords'):
+            for q,coords in enumerate(code.qubit_coords):
+                circ.append('QUBIT_COORDS', q, coords)
+
+        qubit_time_last_used: dict[int, int] = dict()
+        meas_counter: dict[int, list[int]] = dict() # meas index of each measurement
+        meas_count: int = 0
+        instrs_sort = np.argsort(self.instruction_start_times)
+        instructions = [self.instructions[i] for i in instrs_sort]
+        instruction_start_times = [self.instruction_start_times[i] for i in instrs_sort]
+        instr_dag = nx.DiGraph()
+        for i,instr in enumerate(instructions):
+            instr_dag.add_node(i)
+        for q,indices in self.instructions_by_qubit.items():
+            for i,ii in zip(indices[:-1], indices[1:]):
+                instr_dag.add_edge(i, ii)
+        last_start_time = 0
+        for instr, start_time in zip(instructions, instruction_start_times):
+            # apply idle errors
+            if not isinstance(instr, Instantiate) and start_time > last_start_time:
+                idle_ops: dict[float, list[int]] = dict()
+                for q in instr.qubits_list():
+                    if qubit_time_last_used[q] < start_time:
+                        idle_time = start_time - qubit_time_last_used[q]
+                        idle_err = 1 - np.exp(-idle_time*1e-9 / error_params.T2)
+                        idle_ops.setdefault(idle_err, []).append(q)
+                for idle_err, qs in idle_ops.items():
+                    circ.append('Z_ERROR', qs, min(0.75, idle_err))
+                last_start_time = start_time
 
             # apply instruction
             if isinstance(instr, Gate):
@@ -381,7 +501,7 @@ class CompiledShuttlingSchedule:
             elif isinstance(instr, Shuttle):
                 circ.append('Z_ERROR', instr.qubit, error_params.shuttle_err)
             elif isinstance(instr, EmplaceDisplace):
-                circ.append('DEPOLARIZE1', instr.qubit, min(0.75, error_params.emplace_err))
+                circ.append('Z_ERROR', instr.qubit, min(0.75, error_params.emplace_err))
             else:
                 raise ValueError('Unsupported instruction:', instr)
             
@@ -407,7 +527,7 @@ class CompiledShuttlingSchedule:
             circ.append('OBSERVABLE_INCLUDE', [stim.target_rec(meas_counter[q][-1] - meas_count) for q in logicals], i)
 
         return circ
-    
+
     def update_safe_intervals(
             self,
             node_safe_intervals: dict[DeviceComponent, dict[tuple[int, int], list[tuple[int, int]]]],
@@ -1239,7 +1359,171 @@ class UnitCellDevice:
         if self.debug:
             print(*args)
 
+def circ_dag(circ) -> nx.DiGraph:
+    dag = nx.DiGraph()
+    meas_history = []
+    last_instr_by_qubit: dict[int, int] = dict()
+    for i,instr in enumerate(circ):
+        dag.add_node(i)
+        if instr.name == 'DETECTOR' or instr.name == 'OBSERVABLE_INCLUDE':
+            for target in set(instr.targets_copy()):
+                assert target.value < 0
+                qubit = meas_history[target.value]
+                if qubit in last_instr_by_qubit:
+                    if last_instr_by_qubit[qubit] != i:
+                        dag.add_edge(last_instr_by_qubit[qubit], i)
+            last_instr_by_qubit[qubit] = i
+        else:
+            if instr.name in ['M', 'MX']:
+                for t in instr.targets_copy():
+                    qubit = t.qubit_value
+                    assert qubit is not None
+                    meas_history.append(qubit)
+            for target in set(instr.targets_copy()):
+                assert target.is_qubit_target
+                qubit = target.qubit_value
+                if qubit in last_instr_by_qubit:
+                    if last_instr_by_qubit[qubit] == i:
+                        raise RuntimeError
+                    dag.add_edge(last_instr_by_qubit[qubit], i)
+                last_instr_by_qubit[qubit] = i
+    return dag
+
+def instr_targets(instr, ignore_non_qubits = True) -> list[int]:
+    tgts = []
+    for tgt in instr.targets_copy():
+        if ignore_non_qubits and not tgt.is_qubit_target:
+            continue
+        assert tgt.is_qubit_target
+        tgts.append(tgt.qubit_value)
+    return tgts
+
 def simplify_stim_circuit(circ) -> stim.Circuit:
-    circ_new = stim.Circuit
+    # 1. Combine errors on the same qubit
+    last_instr_per_qubit = dict()
+    instr_accumulated_arg = dict()
+    new_circ = stim.Circuit()
     for instr in circ:
-        pass
+        if len(instr.targets_copy()) == 1 and ('ERROR' in instr.name or 'DEPOLARIZE' in instr.name):
+            target = instr.targets_copy()[0]
+            assert len(instr.gate_args_copy()) == 1
+            gate_arg = instr.gate_args_copy()[0]
+            assert target.is_qubit_target
+            qubit = target.qubit_value
+            if instr.name == last_instr_per_qubit.get(qubit, None):
+                instr_accumulated_arg[qubit].append(gate_arg)
+            else:
+                # complete old instruction
+                if qubit in last_instr_per_qubit:
+                    reduced_arg = 1
+                    for arg in instr_accumulated_arg[qubit]:
+                        reduced_arg *= (1 - arg)
+                    reduced_arg = 1 - reduced_arg
+                    new_circ.append(last_instr_per_qubit[qubit], qubit, reduced_arg)
+
+                # start new instruction
+                last_instr_per_qubit[qubit] = instr.name
+                instr_accumulated_arg[qubit] = [gate_arg]
+        else:
+            for target in instr.targets_copy():
+                if target.is_qubit_target:
+                    qubit = target.qubit_value
+                    if qubit in last_instr_per_qubit:
+                        reduced_arg = 1
+                        for arg in instr_accumulated_arg[qubit]:
+                            reduced_arg *= (1 - arg)
+                        reduced_arg = 1 - reduced_arg
+                        new_circ.append(last_instr_per_qubit[qubit], qubit, reduced_arg)
+                        last_instr_per_qubit.pop(qubit)
+                        instr_accumulated_arg.pop(qubit)
+            new_circ.append(instr)
+    # new_circ = circ
+    print(f'Reduced circuit length from {len(circ)} to {len(new_circ)}')
+
+    # 2. Combine instructions that are the same on multiple qubits
+    # First, combine gates
+    change_made = True
+    search_depth = 3
+    new_new_circ = stim.Circuit()
+    last_circ = new_circ
+    while change_made:
+        print(f'\nLooping. Current circuit length {len(last_circ)}...')
+        dag = circ_dag(last_circ)
+        new_circ = stim.Circuit()
+        generations = list(nx.topological_generations(dag))
+        processed_indices = set()
+        unprocessed_indices = set(range(len(last_circ)))
+        frontier = list(generations[0])
+        change_made = False
+
+        # Iterate through the circuit instructions. Upon reaching a
+        # gate/reset/measure, remember it and then continue to iterate through
+        # the circuit instructions looking for matching instructions on other
+        # qubits.
+
+        while frontier:
+            if change_made:
+                break
+            combined_instrs = []
+            combined_qubits = set()
+            instr_idx = frontier.pop(0)
+            instr = last_circ[instr_idx]
+            if instr.name in ['CX', 'CZ', 'R', 'M', 'MX', 'RX', 'H']:
+                # Find matching instructions on other qubits
+                combined_qubits |= set(instr_targets(instr))
+                combined_instrs.append(instr_idx)
+                generation_idx = [i for i,gen in enumerate(generations) if instr_idx in gen][0]
+                potential_siblings = [i for gen in generations[max(0, generation_idx - search_depth):min(len(generations)-1,  generation_idx + search_depth)] for i in gen if i in unprocessed_indices]
+                potential_siblings = [i for i in potential_siblings if not nx.has_path(dag, i, instr_idx) and not nx.has_path(dag, instr_idx, i)]
+                while potential_siblings:
+                    sib = potential_siblings.pop(0)
+                    sib_instr = last_circ[sib]
+                    if combined_qubits.intersection(set(instr_targets(sib_instr))):
+                        continue
+                    if sib_instr.name == instr.name:
+                        qs = set(instr_targets(sib_instr))
+                        assert not combined_qubits.intersection(qs)
+                        combined_qubits |= qs
+                        combined_instrs.append(sib)
+
+                        # TODO: need to append all instructions that are topologically
+                        # in front of this instruction
+                        for anc in nx.ancestors(dag, sib):
+                            if anc in unprocessed_indices:
+                                new_circ.append(last_circ[anc])
+                                processed_indices.add(anc)
+                                unprocessed_indices.remove(anc)
+
+                        potential_siblings = [i for i in potential_siblings if not nx.has_path(dag, i, sib) and not nx.has_path(dag, sib, i)]
+            if len(combined_instrs) > 1:
+                print(f'MERGING instructions {combined_instrs}')
+                for i in combined_instrs:
+                    print(i, last_circ[i])
+
+                # TODO: check that all instructions topologically in front of
+                # this one are already processed
+                new_circ.append(instr.name, combined_qubits)
+                for i in combined_instrs:
+                    if i in frontier:
+                        frontier.remove(i)
+                processed_indices |= set(combined_instrs)
+                unprocessed_indices -= set(combined_instrs)
+                change_made = True
+            else:
+                new_circ.append(instr)
+                processed_indices.add(instr_idx)
+                unprocessed_indices.remove(instr_idx)
+            
+            for succ in dag.successors(instr_idx):
+                if succ not in processed_indices and succ not in frontier:
+                    frontier.append(succ)
+        
+        if change_made:
+            # Finish up adding remaining instructions
+            for i in [i for gen in list(nx.topological_generations(dag)) for i in gen]:
+                if i in unprocessed_indices:
+                    new_circ.append(last_circ[i])
+        
+        last_circ = new_circ.copy()
+
+    return new_circ
