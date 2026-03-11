@@ -23,6 +23,8 @@ class QECCode:
     # change simulation results.
     qubit_coords: list[tuple[int, int]] = []
 
+    check_cx_layers: list[list[tuple[int, int]]] = []
+
     def compute_code_parameters(self):
         raise NotImplementedError
     

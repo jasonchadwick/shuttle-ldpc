@@ -49,3 +49,5 @@ class GBCode(QECCode):
         Lx = np.array(self.qldpc_code.get_logical_ops(Pauli.X), dtype=bool)
         Lz = np.array(self.qldpc_code.get_logical_ops(Pauli.Z), dtype=bool)
         return Lx, Lz
+        
+        

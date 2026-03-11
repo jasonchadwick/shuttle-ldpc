@@ -1,3 +1,8 @@
 .venv
-src/__pycache__
+**/__pycache__
+.pytest_cache
 .DS_Store
+*out.txt
+notebooks/data/TMP_matrices
+*results_TMP
+*tasks.pkl

@@ -125,6 +125,15 @@ class HGPCode(QECCode):
             else:
                 self.Z_layers = layers
 
+        self.qubit_coords = [(-1, -1) for _ in range(max(self.data_indices)+1)]
+        s = int(np.sqrt(len(self.data_indices)//2))
+        for i,d in enumerate(self.data_indices):
+            if d < s**2:
+                self.qubit_coords[d] = (d//s+1, d%s+1)
+            else:
+                dd = d-s**2
+                self.qubit_coords[d] = (s + dd%s+1, dd//s+1)
+
     def compute_code_parameters(self):
         """Compute the code parameters N, K, and D for this code."""
         self.N = self.num_data

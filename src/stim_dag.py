@@ -3,16 +3,18 @@ import networkx as nx
 import heapq
 from typing import Any
 
-def instr_target_qubits(instr, qubit_meas_history: list[int]) -> list[int]:
-    tgts = set()
+DEBUG = False
+
+def _instr_target_qubits(instr, qubit_meas_history: list[int]) -> list[int]:
+    tgts = []
     for tgt in instr.targets_copy():
         if tgt.is_qubit_target:
-            tgts.add(tgt.qubit_value)
+            tgts.append(tgt.qubit_value)
         else:
             # TODO: use qubit_meas_history
             assert tgt.value < 0
-            tgts.add(qubit_meas_history[tgt.value])
-    return list(sorted(tgts))
+            tgts.append(qubit_meas_history[tgt.value])
+    return tgts
 
 class InstrNode:
     name: str
@@ -35,7 +37,7 @@ class InstrNode:
             assert instr is not None
             self.name = instr.name
             self.targets_stim = instr.targets_copy()
-            self.qubits = instr_target_qubits(instr, qubit_meas_history)
+            self.qubits = _instr_target_qubits(instr, qubit_meas_history)
             self.args = instr.gate_args_copy()
         else:
             assert name is not None
@@ -87,11 +89,12 @@ class CircDAG:
 
     def __init__(self, dag, instrs):
         self.dag = dag
+        nx.set_node_attributes(self.dag, {i: instrs[i] for i in dag.nodes}, name='instr')
         self.instrs = instrs
 
     def __eq__(self, other):
         if isinstance(other, CircDAG):
-            return nx.is_isomorphic(self.dag, other.dag, node_match=lambda n1,n2: self.instrs[n1] == other.instrs[n2])
+            return nx.is_isomorphic(self.dag, other.dag, node_match=lambda n1,n2: n1['instr'] == n2['instr'])
         else:
             return False
 
@@ -107,12 +110,13 @@ def circ_to_dag(circ) -> CircDAG:
     for instr in circ:
         if not instr.targets_copy():
             continue
+        
         instrnode = InstrNode(instr=instr, qubit_meas_history=meas_history)
 
         instrs.append(instrnode)
         idx = len(instrs)-1
         dag.add_node(idx)
-        for qubit in instrnode.qubits:
+        for qubit in set(instrnode.qubits):
             if qubit in last_instr_by_qubit:
                 dag.add_edge(last_instr_by_qubit[qubit], idx)
             last_instr_by_qubit[qubit] = idx
@@ -133,7 +137,7 @@ def dag_to_circ(dag: CircDAG):
         circ.append(instrnode.name, instrnode.targets_stim, instrnode.args)
     return circ
 
-def expand_dag(circdag: CircDAG):
+def _expand_dag(circdag: CircDAG):
     dag_expanded = nx.DiGraph()
     instrs_expanded = []
     frontier_heap = []
@@ -165,7 +169,7 @@ def expand_dag(circdag: CircDAG):
             else:
                 raise ValueError('Unknown gate name', node.name)
             assert len(node.targets_stim) % qubits_per_instr == 0
-            assert len(node.targets_stim) == len(node.qubits)
+            assert len(node.targets_stim) == len(node.qubits), (node, node.targets_stim, node.qubits)
             covered_qs = []
             for i in range(len(node.targets_stim) // qubits_per_instr):
                 new_node = InstrNode(
@@ -194,7 +198,115 @@ def expand_dag(circdag: CircDAG):
                 frontier_set.add(succ)
     return CircDAG(dag_expanded, instrs_expanded)
 
-def _simplify_dag_helper(circdag: CircDAG, combinable_instrs: list[str], search_depth=10) -> CircDAG:
+def _accumulate_instrs(circdag: CircDAG, combinable_instrs: list[str]):
+    dag_acc = circdag.dag.copy()
+    instrs_acc = circdag.instrs.copy()
+    all_starting_node_indices = set(dag_acc.nodes)
+    frontier = list(next(nx.topological_generations(dag_acc)))
+    processed_set = set()
+    pending_set = set(dag_acc.nodes) - set(frontier)
+    while frontier:
+        frontier_set = set(frontier)
+        assert (frontier_set | processed_set | pending_set).issuperset(all_starting_node_indices)
+        assert not frontier_set.intersection(processed_set)
+        assert not frontier_set.intersection(pending_set)
+        assert not processed_set.intersection(pending_set)
+        idx = frontier.pop(0)
+        node = instrs_acc[idx]
+
+        if node.name in combinable_instrs:
+            # Look through direct successors. Accumulate any instructions with
+            # the same name and qubit.
+            assert len(node.args) == 1 and isinstance(node.args[0], float), node.args
+            combined_indices = [idx]
+            searching = True
+            acc_err = 1 - node.args[0]
+            while searching:
+                succs = list(dag_acc.successors(combined_indices[-1]))
+                if len(succs) != 1:
+                    searching = False
+                else:
+                    succ = succs[0]
+                    succ_node = instrs_acc[succ]
+                    if succ_node.name == node.name and succ_node.qubits == node.qubits:
+                        assert list(dag_acc.predecessors(succ)) == [combined_indices[-1]]
+                        assert succ_node.targets_stim == node.targets_stim
+                        assert len(succ_node.args) == 1 and isinstance(succ_node.args[0], float)
+                        acc_err *= 1 - succ_node.args[0]
+                        combined_indices.append(succ)
+                    else:
+                        searching = False
+            new_instr = InstrNode(node.name, node.targets_stim, node.qubits, 1 - acc_err)
+            new_idx = len(instrs_acc)
+            dag_acc.add_node(new_idx)
+            instrs_acc.append(new_instr)
+            processed_set.add(new_idx)
+            for pred in dag_acc.predecessors(combined_indices[0]):
+                dag_acc.add_edge(pred, new_idx)
+            for succ in dag_acc.successors(combined_indices[-1]):
+                dag_acc.add_edge(new_idx, succ)
+                if succ in pending_set:
+                    frontier.append(succ)
+                    pending_set.remove(succ)
+            for i in combined_indices:
+                if i in frontier:
+                    frontier.remove(i)
+                elif i in pending_set:
+                    pending_set.remove(i)
+                processed_set.add(i)
+                dag_acc.remove_node(i)
+                instrs_acc[i] = None
+        else:
+            for succ in dag_acc.successors(idx):
+                if succ not in processed_set and succ not in frontier:
+                    assert succ in pending_set
+                    frontier.append(succ)
+                    pending_set.remove(succ)
+            processed_set.add(idx)
+            
+    return CircDAG(dag_acc, instrs_acc)
+
+def _update_generations(dag: nx.DiGraph, top_gens: dict[int, int], source_node: int):
+    """Return an updated top_gens dictionary after several nodes were merged
+    into `source_node` in the graph. When this happens, descendants of this new
+    node may or may not have their topological generations updated.
+    """
+    frontier_heap = [(top_gens[source_node], source_node)]
+    while frontier_heap:
+        _, node = heapq.heappop(frontier_heap)
+        for succ in dag.successors(node):
+            gen_old = top_gens[succ]
+            gen_new = max(top_gens[pred] for pred in dag.predecessors(succ)) + 1
+            if gen_old != gen_new:
+                heapq.heappush(frontier_heap, (gen_new, succ))
+                top_gens[succ] = gen_new
+    return top_gens
+
+def project_frontier(dag: nx.DiGraph, frontier: set[int], max_depth: int, exclude_descendants_of: int | None = None, exclude_depth: int | None = None):
+    if exclude_descendants_of:
+        assert exclude_depth is not None
+        nodes_exclude = project_frontier(dag, {exclude_descendants_of}, exclude_depth)
+    else:
+        nodes_exclude = set()
+    frontier_heap = heapq.heapify([(0,n) for n in frontier])
+    processed = set()
+    depths = {n:0 for n in frontier}
+    while frontier_heap:
+        gen, node = heapq.heappop(frontier_heap)
+        processed.add(node)
+        for succ in dag.successors(node):
+            if succ in nodes_exclude:
+                continue
+            preds = dag.predecessors(succ)
+            if all(p in processed for p in dag.predecessors(succ)):
+                depth = max(depths[p] for p in preds) + 1
+                if depth > max_depth:
+                    continue
+                depths[succ] = depth
+                heapq.heappush(frontier_heap, (depth, succ))
+    return processed
+
+def _condense_dag(circdag: CircDAG, combinable_instrs: list[str]) -> CircDAG:
     # Useful helper if we want to run multiple passes. E.g. first combine CX
     # gates, then single-qubit gates, then Ms and Rs, then errors.
     dag_simplified = circdag.dag.copy()
@@ -204,12 +316,20 @@ def _simplify_dag_helper(circdag: CircDAG, combinable_instrs: list[str], search_
     gen_by_idx = {i: g for g,ii in enumerate(top_gens) for i in ii}
     for n in top_gens[0]:
         heapq.heappush(frontier_heap, (0, n))
+    all_starting_node_indices = set(dag_simplified.nodes)
     frontier_set = set(top_gens[0])
     processed_set = set()
-    unprocessed_set = set(dag_simplified.nodes)
+    pending_set = set(dag_simplified.nodes) - frontier_set
     while frontier_heap:
+        if DEBUG:
+            assert (frontier_set | processed_set | pending_set).issuperset(all_starting_node_indices)
+            assert not frontier_set.intersection(processed_set)
+            assert not frontier_set.intersection(pending_set)
+            assert not processed_set.intersection(pending_set)
+            assert frontier_set == {i for _,i in frontier_heap}
         _,idx = heapq.heappop(frontier_heap)
-        assert idx in frontier_set
+        if DEBUG:
+            assert idx in frontier_set
         frontier_set.remove(idx)
         node = instrs_simplified[idx]
 
@@ -223,10 +343,8 @@ def _simplify_dag_helper(circdag: CircDAG, combinable_instrs: list[str], search_
             # this and would have picked this up.
             combined_indices = [idx]
 
-            print(idx, set(nx.descendants(dag_simplified, idx)))
-            possible_siblings = unprocessed_set - set(nx.descendants(dag_simplified, idx))
-            print(idx, possible_siblings)
-            possible_siblings.remove(idx)
+            # possible_siblings = pending_set - set(nx.descendants(dag_simplified, idx))
+            possible_siblings = project_frontier(dag_simplified, frontier_set, max_depth=20, exclude_descendants_of=idx, exclude_depth=21)
             while possible_siblings:
                 sib = min(possible_siblings, key=lambda s: gen_by_idx[s])
                 possible_siblings.remove(sib)
@@ -237,7 +355,8 @@ def _simplify_dag_helper(circdag: CircDAG, combinable_instrs: list[str], search_
                     combined_indices.append(sib)
 
                     # TODO: this feels expensive...
-                    possible_siblings -= set(nx.descendants(dag_simplified, sib))
+                    # possible_siblings -= set(nx.descendants(dag_simplified, sib))
+                    possible_siblings -= project_frontier(dag_simplified, {sib}, 20)
             
             if len(combined_indices) > 1:
                 new_node = InstrNode(
@@ -249,42 +368,56 @@ def _simplify_dag_helper(circdag: CircDAG, combinable_instrs: list[str], search_
                 new_idx = len(instrs_simplified)
                 instrs_simplified.append(new_node)
                 dag_simplified.add_node(new_idx)
+                gen_by_idx[new_idx] = max(gen_by_idx[ci] for ci in combined_indices)
                 for ci in combined_indices:
                     for pred in dag_simplified.predecessors(ci):
                         dag_simplified.add_edge(pred, new_idx)
                     for succ in dag_simplified.successors(ci):
                         dag_simplified.add_edge(new_idx, succ)
-                        frontier_set.add(ci)
+                        if succ in pending_set:
+                            frontier_set.add(succ)
+                            pending_set.remove(succ)
 
                     if ci in frontier_set:
                         frontier_set.remove(ci)
+                    elif ci in pending_set:
+                        pending_set.remove(ci)
                     processed_set.add(ci)
-                    if ci in unprocessed_set:
-                        unprocessed_set.remove(ci)
+
                     dag_simplified.remove_node(ci)
+                    gen_by_idx.pop(ci)
                     instrs_simplified[ci] = None
+                frontier_set.add(new_idx)
             
-                # TODO: may be a more efficient way to recalculate generations here
-                top_gens = [list(gen) for gen in nx.topological_generations(dag_simplified)]
-                gen_by_idx = {i: g for g,ii in enumerate(top_gens) for i in ii}
+                # TODO: may be a more efficient way to recalculate generations
+                # here
+                # Intuition: when we merge nodes, all successors of this node
+                # now can be reached in generation(new node) + 1 steps. IF this
+                # changes the topological generation of the node, we need to
+                # propagate this change further through the descendants.
+                # Basically do BFS through descendants until we are no longer
+                # updating topological generations.
+                # top_gens = [list(gen) for gen in nx.topological_generations(dag_simplified)]
+                # gen_by_idx = {i: g for g,ii in enumerate(top_gens) for i in ii}
+                gen_by_idx = _update_generations(dag_simplified, gen_by_idx, new_idx)
                 frontier_heap = [(gen_by_idx[node], node) for node in frontier_set]
                 heapq.heapify(frontier_heap)
             else:
                 for succ in dag_simplified.successors(idx):
-                    if succ not in processed_set:
-                        assert succ in unprocessed_set
+                    if succ not in processed_set and succ not in frontier_set:
+                        assert succ in pending_set
                         frontier_set.add(succ)
                         heapq.heappush(frontier_heap, (gen_by_idx[succ], succ))
+                        pending_set.remove(succ)
                 processed_set.add(idx)
-                unprocessed_set.remove(idx)
         else:
             for succ in dag_simplified.successors(idx):
-                if succ not in processed_set:
-                    assert succ in unprocessed_set
+                if succ not in processed_set and succ not in frontier_set:
+                    assert succ in pending_set
                     frontier_set.add(succ)
                     heapq.heappush(frontier_heap, (gen_by_idx[succ], succ))
+                    pending_set.remove(succ)
             processed_set.add(idx)
-            unprocessed_set.remove(idx)
     
     # Relabel instructions to remove the empty ones that we merged in
     relabel_dict = {}
@@ -301,25 +434,23 @@ def _simplify_dag_helper(circdag: CircDAG, combinable_instrs: list[str], search_
     dag_simplified_clean = nx.relabel_nodes(dag_simplified, relabel_dict)
     return CircDAG(dag_simplified_clean, instrs_simplified_clean)
 
-def simplify_dag(circdag: CircDAG):
+def simplify_dag(circdag: CircDAG, accumulate: bool = True, condense: bool = True):
     # TODO: merge identical error instructions with same qubits but different
     # args
-
     error_names = ['X_ERROR', 'Y_ERROR', 'Z_ERROR', 'DEPOLARIZE1', 'DEPOLARIZE2']
     gate_names_2q = ['CX', 'CY', 'CZ']
     gate_names_1q = ['X', 'Y', 'Z', 'H', 'S', 'Sdg']
     mr_names = ['M', 'MR', 'MX', 'MY', 'MZ', 'MRX', 'MRY', 'MRZ', 'R', 'RX', 'RY', 'RZ']
-    # TODO: merging M-type instructions is a bit more complicated, so might wait
-    # on that one for now...
-    circdag_new = _simplify_dag_helper(circdag, gate_names_2q)
-    # circdag_new = _simplify_dag_helper(circdag_new, gate_names_1q)
-    # # circdag_new = _simplify_dag_helper(circdag_new, gate_names_2q)
-    # circdag_new = _simplify_dag_helper(circdag_new, error_names)
 
+    circdag_new = _condense_dag(circdag, mr_names)
+    circdag_new = _condense_dag(circdag_new, gate_names_2q)
+    circdag_new = _condense_dag(circdag_new, gate_names_1q)
+    circdag_new = _condense_dag(circdag_new, error_names)
+    circdag_new = _accumulate_instrs(circdag_new, error_names)
     return circdag_new
 
-def simplify_circ(circ: stim.Circuit):
-    return dag_to_circ(simplify_dag(circ_to_dag(circ)))
+def simplify_circ(circ: stim.Circuit, accumulate: bool = True, condense: bool = True):
+    return dag_to_circ(simplify_dag(circ_to_dag(circ), accumulate=accumulate, condense=condense))
 
-def dag_eq(dag):
-    raise NotImplementedError
+def circ_eq(circ0, circ1):
+    return _expand_dag(circ_to_dag(circ0)) == _expand_dag(circ_to_dag(circ1))

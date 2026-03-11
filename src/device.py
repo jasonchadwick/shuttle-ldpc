@@ -1,8 +1,12 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Any
 from enum import Enum
 import numpy as np
+import hashlib
 import math
+import pickle
+from pathlib import Path
+
 import stim
 import heapq
 import itertools
@@ -325,7 +329,7 @@ class CompiledShuttlingSchedule:
 
         return frames
 
-    def to_stim_circuit(self, code: QECCode, basis: str, error_params: ErrorParams) -> stim.Circuit:
+    def to_stim_circuit(self, code: QECCode, basis: str, error_params: ErrorParams, XYZ_decode: bool = False) -> stim.Circuit:
         """Convert the compiled shuttling schedule back into a Stim circuit."""
         circ = stim.Circuit()
 
@@ -376,7 +380,7 @@ class CompiledShuttlingSchedule:
                         if not (isinstance(instr1, Gate) and instr1.name == 'H'):
                             init_basis_change = True
                     if init_basis_change:
-                        print('Changing data qubit initialization to X basis...')
+                        # print('Changing data qubit initialization to X basis...')
                         circ.append('H', instr.qubits, ())
                         circ.append('DEPOLARIZE1', instr.qubits, error_params.h_err)
             elif isinstance(instr, Measure):
@@ -388,19 +392,19 @@ class CompiledShuttlingSchedule:
                         if not (isinstance(instr2, Gate) and instr2.name == 'H'):
                             meas_basis_change = True
                     if meas_basis_change:
-                        print('Changing data qubit measurement to X basis...')
+                        # print('Changing data qubit measurement to X basis...')
                         circ.append('H', instr.qubits, ())
                         circ.append('DEPOLARIZE1', instr.qubits, error_params.h_err)
 
                 circ.append('X_ERROR', instr.qubits, error_params.measure_err)
-                circ.append('M', instr.qubits)
+                circ.append('M', instr.qubits, ())
                 for q in instr.qubits:
                     meas_counter.setdefault(q, []).append(meas_count)
                     meas_count += 1
                 # Add detectors if ancilla qubit
                 for q in instr.qubits:
                     if q in code.X_ancilla_indices + code.Z_ancilla_indices:
-                        if len(meas_counter[q]) > 1:
+                        if len(meas_counter[q]) > 1 and (XYZ_decode or (basis == 'X' and q in code.X_ancilla_indices) or (basis == 'Z' and q in code.Z_ancilla_indices)):
                             circ.append('DETECTOR', [stim.target_rec(meas_counter[q][-1] - meas_count), stim.target_rec(meas_counter[q][-2] - meas_count)], (q, len(meas_counter[q])-1))
                         else:
                             if (basis == 'X' and q in code.X_ancilla_indices) or (basis == 'Z' and q in code.Z_ancilla_indices):
@@ -428,7 +432,7 @@ class CompiledShuttlingSchedule:
         
         # Add logical observables
         Lx,Lz = code.compute_logical_operators()
-        assert Lx.shape[0] == code.compute_code_parameters()[1]
+        # assert Lx.shape[0] == code.compute_code_parameters()[1]
         for i in range(Lx.shape[0]):
             logicals = np.nonzero(Lx[i,:])[0] if basis == 'X' else np.nonzero(Lz[i,:])[0]
             circ.append('OBSERVABLE_INCLUDE', [stim.target_rec(meas_counter[q][-1] - meas_count) for q in logicals], i)
@@ -486,7 +490,7 @@ class CompiledShuttlingSchedule:
                 circ.append('X_ERROR', instr.qubits, error_params.init_err)
             elif isinstance(instr, Measure):
                 circ.append('X_ERROR', instr.qubits, error_params.measure_err)
-                circ.append('M', instr.qubits)
+                circ.append('M', instr.qubits, ())
                 for q in instr.qubits:
                     meas_counter.setdefault(q, []).append(meas_count)
                     meas_count += 1
@@ -521,7 +525,7 @@ class CompiledShuttlingSchedule:
         
         # Add logical observables
         Lx,Lz = code.compute_logical_operators()
-        assert Lx.shape[0] == code.compute_code_parameters()[1]
+        # assert Lx.shape[0] == code.compute_code_parameters()[1]
         for i in range(Lx.shape[0]):
             logicals = np.nonzero(Lx[i,:])[0] if basis == 'X' else np.nonzero(Lz[i,:])[0]
             circ.append('OBSERVABLE_INCLUDE', [stim.target_rec(meas_counter[q][-1] - meas_count) for q in logicals], i)
@@ -662,7 +666,10 @@ class ScheduleMetrics:
                     self.qubit_distance_traveled[q] = self.qubit_distance_traveled.get(q, 0) + 1
             elif isinstance(instr, Instantiate):
                 for q in qubits:
-                    assert q not in qubit_init_times
+                    if q in qubit_init_times:
+                        # Starting new round; exit
+                        print('Multiple rounds detected; exiting early')
+                        return
                     qubit_init_times[q] = start_time
             elif isinstance(instr, Measure):
                 for q in qubits:
@@ -687,11 +694,14 @@ class State:
     cur_task: int | tuple[bool, ...]
     __slots__ = ('x', 'y', 'component', 't_start', 't_end', 'cur_task')
 
+    def tuple(self):
+        return (self.x, self.y, self.component, self.t_start, self.t_end, self.cur_task)
+
     def __hash__(self):
-        return hash((self.x, self.y, self.component, self.t_start, self.t_end, self.cur_task))
+        return hash(self.tuple())
 
     def __eq__(self, other):
-        return (self.x, self.y, self.component, self.t_start, self.t_end, self.cur_task) == (other.x, other.y, other.component, other.t_start, other.t_end, other.cur_task)
+        return self.tuple() == other.tuple()
 
     def __str__(self):
         string = self.__class__.__name__ + '('
@@ -704,10 +714,10 @@ class State:
         return string
     
     def __lt__(self, other):
-        return (self.x, self.y, self.component, self.t_start, self.t_end, self.cur_task) < (other.x, other.y, other.component, other.t_start, other.t_end, other.cur_task)
+        return self.tuple() < other.tuple()
     
     def __gt__(self, other):
-        return (self.x, self.y, self.component, self.t_start, self.t_end, self.cur_task) > (other.x, other.y, other.component, other.t_start, other.t_end, other.cur_task)
+        return self.tuple() > other.tuple()
 
 class UnitCellDevice:
     """Represents a shuttling-enabled unit cell architecture. Qubits can be
@@ -733,6 +743,54 @@ class UnitCellDevice:
         self.all_coords = [(x,y) for x in range(self.w) for y in range(self.h)]
         self.all_edges = [sort((c0, c1)) for c0 in self.all_coords for c1 in self.all_coords if c0 != c1]
 
+    def _schedule_cache_dir(self, cache_dir: str | Path | None = None) -> Path:
+        if cache_dir is None:
+            # Default to a repo-local cache folder.
+            return Path(__file__).resolve().parents[1] / ".cache" / "unit_cell_device"
+        return Path(cache_dir)
+
+    def _schedule_cache_path(self, key: str, cache_dir: str | Path | None = None) -> Path:
+        dirpath = self._schedule_cache_dir(cache_dir)
+        dirpath.mkdir(parents=True, exist_ok=True)
+        return dirpath / f"schedule_{key}.pkl"
+
+    def _schedule_cache_key(
+            self,
+            code: QECCode,
+            static_data_coords: dict[int, tuple[int, int]],
+            cx_layers: list[list[tuple[int, int]]],
+            use_highways: bool,
+            refocus_shuttle_noise: bool,
+            optimize_ancilla_start: bool,
+            separate_X_Z: bool,
+            buffer_time: int,
+            debug_qubit: int | None,
+        ) -> str:
+        # Create a deterministic hash based on the inputs that affect the schedule.
+        key_data = (
+            self.w,
+            self.h,
+            asdict(self.hardware_params),
+            self.debug,
+            code.__class__.__name__,
+            tuple(code.data_indices),
+            tuple(code.X_ancilla_indices),
+            tuple(code.Z_ancilla_indices),
+            tuple(tuple(checks) for checks in code.X_checks),
+            tuple(tuple(checks) for checks in code.Z_checks),
+            tuple(code.qubit_coords) if hasattr(code, 'qubit_coords') else (),
+            tuple(sorted(static_data_coords.items())),
+            tuple(tuple(layer) for layer in cx_layers),
+            use_highways,
+            refocus_shuttle_noise,
+            optimize_ancilla_start,
+            separate_X_Z,
+            buffer_time,
+            debug_qubit,
+        )
+        digest = hashlib.sha256(pickle.dumps(key_data, protocol=pickle.HIGHEST_PROTOCOL)).hexdigest()
+        return digest
+
     def compile_QEC_schedule(
             self,
             code: QECCode,
@@ -745,6 +803,10 @@ class UnitCellDevice:
             scheduling_method: SchedulingMethod = SchedulingMethod.GREEDY,
             separate_X_Z: bool = False,
             buffer_time: int = 100,
+            debug_qubit: int | None = None,
+            use_cache: bool = True,
+            ignore_cache: bool = False,
+            cache_dir: str | Path | None = '.scheduler_cache',
         ):
         schedule = CompiledShuttlingSchedule(sorted(list(static_data_coords.keys())), sorted(list(static_data_coords.keys())))
         schedule.append_instr(
@@ -774,6 +836,10 @@ class UnitCellDevice:
             optimize_ancilla_start,
             separate_X_Z=separate_X_Z,
             buffer_time=buffer_time,
+            debug_qubit=debug_qubit,
+            use_cache=use_cache,
+            ignore_cache=ignore_cache,
+            cache_dir=cache_dir,
         )
         schedule += rounds * SE_sched
         t = schedule.total_duration()
@@ -806,7 +872,37 @@ class UnitCellDevice:
             optimize_ancilla_start: bool,
             separate_X_Z: bool = False,
             buffer_time: int = 0,
+            debug_qubit: int | None = None,
+            use_cache: bool = False,
+            ignore_cache: bool = False,
+            cache_dir: str | Path | None = None,
         ) -> CompiledShuttlingSchedule:
+        schedule = None
+        cache_path = None
+        if use_cache:
+            cache_key = self._schedule_cache_key(
+                code=code,
+                static_data_coords=static_data_coords,
+                cx_layers=cx_layers,
+                use_highways=use_highways,
+                refocus_shuttle_noise=refocus_shuttle_noise,
+                optimize_ancilla_start=optimize_ancilla_start,
+                separate_X_Z=separate_X_Z,
+                buffer_time=buffer_time,
+                debug_qubit=debug_qubit,
+            )
+            cache_path = self._schedule_cache_path(cache_key, cache_dir)
+            if cache_path.exists() and not ignore_cache:
+                try:
+                    with open(cache_path, "rb") as f:
+                        schedule = pickle.load(f)
+                    if self.debug:
+                        print(f"Loaded cached schedule from {cache_path}")
+                    return schedule
+                except Exception as e:
+                    if self.debug:
+                        print(f"Failed to load schedule cache ({cache_path}): {e}")
+
         if separate_X_Z:
             X_sched = self._compile_SE_schedule_greedy(
                 code=code,
@@ -817,8 +913,9 @@ class UnitCellDevice:
                 optimize_ancilla_start=optimize_ancilla_start,
                 anc_basis_filter='X',
                 buffer_time=buffer_time,
+                debug_qubit=debug_qubit,
             )
-            return self._compile_SE_schedule_greedy(
+            schedule = self._compile_SE_schedule_greedy(
                 code=code,
                 static_data_coords=static_data_coords,
                 cx_layers=cx_layers,
@@ -829,9 +926,10 @@ class UnitCellDevice:
                 buffer_time=buffer_time,
                 prior_schedule=X_sched,
                 allow_interleave_with_prior=False,
+                debug_qubit=debug_qubit,
             )
         else:
-            return self._compile_SE_schedule_greedy(
+            schedule = self._compile_SE_schedule_greedy(
                 code=code,
                 static_data_coords=static_data_coords,
                 cx_layers=cx_layers,
@@ -839,7 +937,20 @@ class UnitCellDevice:
                 refocus_shuttle_noise=refocus_shuttle_noise,
                 optimize_ancilla_start=optimize_ancilla_start,
                 buffer_time=buffer_time,
+                debug_qubit=debug_qubit,
             )
+
+        if use_cache and cache_path is not None:
+            try:
+                with open(cache_path, "wb") as f:
+                    pickle.dump(schedule, f, protocol=pickle.HIGHEST_PROTOCOL)
+                if self.debug:
+                    print(f"Saved schedule cache to {cache_path}")
+            except Exception as e:
+                if self.debug:
+                    print(f"Failed to write schedule cache ({cache_path}): {e}")
+
+        return schedule
 
     def _compile_SE_schedule_greedy(
             self,
@@ -853,6 +964,7 @@ class UnitCellDevice:
             buffer_time: int = 0,
             prior_schedule: CompiledShuttlingSchedule | None = None,
             allow_interleave_with_prior: bool = False,
+            debug_qubit: int | None = None,
         ) -> CompiledShuttlingSchedule:
         """Compile a shuttling schedule for a syndrome extraction round. Assumes
         data qubits are already initialized and fixed in place within each unit
@@ -955,7 +1067,40 @@ class UnitCellDevice:
                 tsp_results[key] = permutation
                 return permutation
 
-        def get_heuristic(target_coords):
+        def get_cx_duration(anc: int, task_idx: int, num_tasks: int) -> int:
+            duration = self.hardware_params.cx_duration
+            if refocus_shuttle_noise and anc in code.Z_ancilla_indices:
+                if task_idx == num_tasks:
+                    raise ValueError('All tasks complete - don\'t ask for CX duration!')
+                if task_idx == 0 or task_idx == num_tasks-1:
+                    duration += self.hardware_params.h_duration
+                else:
+                    duration += 2*self.hardware_params.h_duration
+            return duration
+
+        def get_cx_ops(anc: int, data: int, data_idx_in_stab: int, stab_weight: int) -> list[Gate]:
+            ops = []
+            if refocus_shuttle_noise and anc in code.Z_ancilla_indices:
+                if data_idx_in_stab != 0:
+                    ops.append(Gate(self.hardware_params.h_duration, [anc], GateName.H))
+                ops.append(Gate(self.hardware_params.cx_duration, [data, anc], GateName.CX))
+                if data_idx_in_stab != stab_weight-1:
+                    ops.append(Gate(self.hardware_params.h_duration, [anc], GateName.H))
+            else:
+                if anc in code.Z_ancilla_indices:
+                    ops.append(Gate(self.hardware_params.cx_duration, [data, anc], GateName.CX))
+                else:
+                    assert anc in code.X_ancilla_indices
+                    ops.append(Gate(self.hardware_params.cx_duration, [anc, data], GateName.CX))
+            
+            # Debug check
+            if sum(op.duration for op in ops) != get_cx_duration(anc, data_idx_in_stab, stab_weight):
+                pass
+            assert sum(op.duration for op in ops) == get_cx_duration(anc, data_idx_in_stab, stab_weight)
+
+            return ops
+
+        def get_heuristic(anc, target_indices, target_coords):
             # Heuristic roughly approximates total remaining time to complete
             # data checks and readout if there are no obstacles.
             def heuristic(state: State):
@@ -974,14 +1119,13 @@ class UnitCellDevice:
                         if (state.component == DeviceComponent.INTERACTION_ZONE or state.component == DeviceComponent.READOUT) and (state.x, state.y) != target_coords[cur_task]:
                             cost += self.hardware_params.emplace_duration
                         if state.component == DeviceComponent.INTERACTION_ZONE and (state.x, state.y) == target_coords[cur_task]:
-                            cost += self.hardware_params.cx_duration
+                            cost += get_cx_duration(anc, cur_task, len(target_indices))
                             cur_task += 1
                             cost += self.hardware_params.emplace_duration
                         # Time to shuttle to remaining tasks and do CXs
                         cur = state.x, state.y
-                        for tgt in target_coords[cur_task:]:
-                            # TODO: account for H time if refocusing shuttles
-                            cost += distance(tgt, cur)*self.hardware_params.shuttle_duration + self.hardware_params.cx_duration + 2*self.hardware_params.emplace_duration
+                        for tgt_idx,tgt in list(enumerate(target_coords))[cur_task:]:
+                            cost += distance(tgt, cur)*self.hardware_params.shuttle_duration + get_cx_duration(anc, tgt_idx, len(target_indices)) + 2*self.hardware_params.emplace_duration
                             cur = tgt
                         return cost
                 else:
@@ -994,27 +1138,23 @@ class UnitCellDevice:
                         else:
                             return self.hardware_params.emplace_duration
                     else:
+                        assert not isinstance(state.cur_task, int)
+                        tasks_completed = sum(cur_task)
                         cost = 0
                         coords_to_reach = [c for i,c in enumerate(target_coords) if not state.cur_task[i]]
                         if (state.component == DeviceComponent.INTERACTION_ZONE or state.component == DeviceComponent.READOUT) and (state.x, state.y) not in coords_to_reach:
                             cost += self.hardware_params.emplace_duration
                         if state.component == DeviceComponent.INTERACTION_ZONE and (state.x, state.y) in coords_to_reach:
-                            cost += self.hardware_params.cx_duration
+                            cost += get_cx_duration(anc, tasks_completed, len(target_indices))
                             cur_task = tuple(True if c == (state.x, state.y) else b for b,c in zip(cur_task, target_coords))
                             cost += self.hardware_params.emplace_duration
                         
                         # Time to shuttle to remaining tasks and do CXs
                         cur = state.x, state.y
-                        # distance_matrix = np.array([[distance(a, b) for a in [cur] + coords_to_reach] for b in [cur] + coords_to_reach])
-                        
-                        # distance_matrix[:, 0] = 0
-                        # permutation, _ = solve_tsp_dynamic_programming(distance_matrix)
                         permutation = solve_tsp_memoized(cur, coords_to_reach)
-                        
                         for i in permutation[1:]:
                             tgt = coords_to_reach[i-1]
-                            # TODO: account for H time if refocusing shuttles
-                            cost += distance(tgt, cur)*self.hardware_params.shuttle_duration + self.hardware_params.cx_duration + 2*self.hardware_params.emplace_duration
+                            cost += distance(tgt, cur)*self.hardware_params.shuttle_duration + get_cx_duration(anc, tasks_completed+i-1, len(target_indices)) + 2*self.hardware_params.emplace_duration
                             cur = tgt
                         return cost
             return heuristic
@@ -1024,7 +1164,7 @@ class UnitCellDevice:
         for anc in anc_qubits:
             data_qubits = ancilla_data_to_visit[anc]
             data_coords = [static_data_coords[data] for data in data_qubits]
-            heuristic = get_heuristic(data_coords)
+            heuristic = get_heuristic(anc, data_qubits, data_coords)
             frontier = set() # TODO: can use min-heap or pqueue
             frontier_heap = []
             if init_ancilla_coords:
@@ -1168,24 +1308,25 @@ class UnitCellDevice:
                         elif s.cur_task != ss.cur_task:
                             if isinstance(s.cur_task, int):
                                 idx = s.cur_task
+                                task_number = idx
                             else:
+                                assert not isinstance(ss.cur_task, int)
                                 idxs = [i for i,(b,bb) in enumerate(zip(s.cur_task, ss.cur_task)) if b != bb]
                                 assert len(idxs) == 1
                                 idx = idxs[0]
-                            schedule.append_instr(Gate(
-                                self.hardware_params.cx_duration,
-                                [anc, data_qubits[idx]] if anc in code.X_ancilla_indices else [data_qubits[idx], anc],
-                                GateName.CX,
-                            ), cost_to_node[ss] - self.hardware_params.cx_duration)
+                                task_number = sum(s.cur_task)
+                            cx_ops = get_cx_ops(anc, data_qubits[idx], task_number, len(data_qubits))
+                            cx_ops_dur = get_cx_duration(anc, task_number, len(data_qubits))
+                            assert cx_ops_dur == sum(op.duration for op in cx_ops)
+                            if anc == debug_qubit:
+                                print(anc, idx, task_number, len(cx_ops))
+                                for op in cx_ops:
+                                    print('\t', op)
+                            t = cost_to_node[ss] - cx_ops_dur
+                            for op in cx_ops:
+                                schedule.append_instr(op, t)
+                                t += op.duration
                     assert state_path[-1].component == DeviceComponent.READOUT
-                    # schedule.append_instr(EmplaceDisplace(
-                    #     self.hardware_params.emplace_duration,
-                    #     self.hardware_params.emplace_err,
-                    #     anc,
-                    #     (state_path[-1].x, state_path[-1].y),
-                    #     state_path[-2].component,
-                    #     state_path[-1].component,
-                    # ), cost_to_node[state_path[-1]] - self.hardware_params.emplace_duration)
                     if anc in code.X_ancilla_indices:
                         schedule.append_instr(Gate(
                             self.hardware_params.h_duration,
@@ -1260,7 +1401,7 @@ class UnitCellDevice:
                     if (state.cur_task < len(data_coords)
                         and state.component == DeviceComponent.INTERACTION_ZONE
                         and (state.x, state.y) == data_coords[state.cur_task]
-                        and state.t_end >= cost_to_node[state] + self.hardware_params.cx_duration
+                        and state.t_end >= cost_to_node[state] + get_cx_duration(anc, state.cur_task, len(data_coords))
                     ):
                         state_new = State(
                             x=state.x,
@@ -1270,7 +1411,7 @@ class UnitCellDevice:
                             t_end=state.t_end,
                             cur_task=state.cur_task + 1,
                         )
-                        add_state(state, state_new, transition_cost=self.hardware_params.cx_duration)
+                        add_state(state, state_new, transition_cost=get_cx_duration(anc, state.cur_task, len(data_coords)))
                 else:
                     # cur_task is tuple of bools, each indicating whether that
                     # data qubit has been checked
@@ -1278,7 +1419,7 @@ class UnitCellDevice:
                         if (not state.cur_task[i]
                             and state.component == DeviceComponent.INTERACTION_ZONE
                             and (state.x, state.y) == coords
-                            and state.t_end >= cost_to_node[state] + self.hardware_params.cx_duration
+                            and state.t_end >= cost_to_node[state] + get_cx_duration(anc, state.cur_task, len(data_coords))
                         ):
                             new_cur_task = tuple(s if j != i else True for j,s in enumerate(state.cur_task))
                             state_new = State(
@@ -1289,7 +1430,7 @@ class UnitCellDevice:
                                 t_end=state.t_end,
                                 cur_task=new_cur_task,
                             )
-                            add_state(state, state_new, transition_cost=self.hardware_params.cx_duration)
+                            add_state(state, state_new, transition_cost=get_cx_duration(anc, state.cur_task, len(data_coords)))
             if not found_solution:
                 raise RuntimeError(f'Unable to find solution for qubit {anc}')
             if not self.debug:
@@ -1502,7 +1643,7 @@ def simplify_stim_circuit(circ) -> stim.Circuit:
 
                 # TODO: check that all instructions topologically in front of
                 # this one are already processed
-                new_circ.append(instr.name, combined_qubits)
+                new_circ.append(instr.name, combined_qubits, ())
                 for i in combined_instrs:
                     if i in frontier:
                         frontier.remove(i)

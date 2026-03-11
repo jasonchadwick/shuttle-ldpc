@@ -18,7 +18,7 @@ def test_dag_expand():
     # Test that dag_expand maintains correct circuit
     circ = stim.Circuit.generated('surface_code:rotated_memory_x', distance=3, rounds=2, after_clifford_depolarization=0.01, before_round_data_depolarization=0.02, before_measure_flip_probability=0.03)
     circdag = stim_dag.circ_to_dag(circ)
-    circdag_expanded = stim_dag.expand_dag(circdag)
-    circdag_expanded1 = stim_dag.expand_dag(stim_dag.circ_to_dag(stim_dag.dag_to_circ(circdag)))
+    circdag_expanded = stim_dag._expand_dag(circdag)
+    circdag_expanded1 = stim_dag._expand_dag(stim_dag.circ_to_dag(stim_dag.dag_to_circ(circdag)))
     assert nx.utils.graphs_equal(circdag_expanded.dag, circdag_expanded1.dag)
     assert circdag_expanded.instrs == circdag_expanded1.instrs
