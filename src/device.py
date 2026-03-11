@@ -704,14 +704,7 @@ class State:
         return self.tuple() == other.tuple()
 
     def __str__(self):
-        string = self.__class__.__name__ + '('
-        for key,val in self.__dict__.items():
-            if isinstance(val, float):
-                string += f'{key}={val:3g}, '
-            else:
-                string += f'{key}={val}, '
-        string = string[:-2] + ')'
-        return string
+        return f'State(x={self.x}, y={self.y}, component={self.component}, t_start={self.t_start}, t_end={self.t_end}, cur_task={self.cur_task})'
     
     def __lt__(self, other):
         return self.tuple() < other.tuple()
@@ -761,7 +754,6 @@ class UnitCellDevice:
             cx_layers: list[list[tuple[int, int]]],
             use_highways: bool,
             refocus_shuttle_noise: bool,
-            optimize_ancilla_start: bool,
             separate_X_Z: bool,
             buffer_time: int,
             debug_qubit: int | None,
@@ -783,7 +775,7 @@ class UnitCellDevice:
             tuple(tuple(layer) for layer in cx_layers),
             use_highways,
             refocus_shuttle_noise,
-            optimize_ancilla_start,
+            True,
             separate_X_Z,
             buffer_time,
             debug_qubit,
@@ -799,7 +791,6 @@ class UnitCellDevice:
             rounds: int,
             use_highways: bool,
             refocus_shuttle_noise: bool,
-            optimize_ancilla_start: bool,
             scheduling_method: SchedulingMethod = SchedulingMethod.GREEDY,
             separate_X_Z: bool = False,
             buffer_time: int = 100,
@@ -833,7 +824,6 @@ class UnitCellDevice:
             cx_layers,
             use_highways,
             refocus_shuttle_noise,
-            optimize_ancilla_start,
             separate_X_Z=separate_X_Z,
             buffer_time=buffer_time,
             debug_qubit=debug_qubit,
@@ -869,7 +859,6 @@ class UnitCellDevice:
             cx_layers: list[list[tuple[int, int]]],
             use_highways: bool,
             refocus_shuttle_noise: bool,
-            optimize_ancilla_start: bool,
             separate_X_Z: bool = False,
             buffer_time: int = 0,
             debug_qubit: int | None = None,
@@ -886,7 +875,6 @@ class UnitCellDevice:
                 cx_layers=cx_layers,
                 use_highways=use_highways,
                 refocus_shuttle_noise=refocus_shuttle_noise,
-                optimize_ancilla_start=optimize_ancilla_start,
                 separate_X_Z=separate_X_Z,
                 buffer_time=buffer_time,
                 debug_qubit=debug_qubit,
@@ -910,7 +898,6 @@ class UnitCellDevice:
                 cx_layers=cx_layers,
                 use_highways=use_highways,
                 refocus_shuttle_noise=refocus_shuttle_noise,
-                optimize_ancilla_start=optimize_ancilla_start,
                 anc_basis_filter='X',
                 buffer_time=buffer_time,
                 debug_qubit=debug_qubit,
@@ -921,7 +908,6 @@ class UnitCellDevice:
                 cx_layers=cx_layers,
                 use_highways=use_highways,
                 refocus_shuttle_noise=refocus_shuttle_noise,
-                optimize_ancilla_start=optimize_ancilla_start,
                 anc_basis_filter='Z',
                 buffer_time=buffer_time,
                 prior_schedule=X_sched,
@@ -935,7 +921,6 @@ class UnitCellDevice:
                 cx_layers=cx_layers,
                 use_highways=use_highways,
                 refocus_shuttle_noise=refocus_shuttle_noise,
-                optimize_ancilla_start=optimize_ancilla_start,
                 buffer_time=buffer_time,
                 debug_qubit=debug_qubit,
             )
@@ -959,7 +944,6 @@ class UnitCellDevice:
             cx_layers: list[list[tuple[int, int]]],
             use_highways: bool,
             refocus_shuttle_noise: bool,
-            optimize_ancilla_start: bool,
             anc_basis_filter: str | None = None,
             buffer_time: int = 0,
             prior_schedule: CompiledShuttlingSchedule | None = None,
@@ -975,6 +959,8 @@ class UnitCellDevice:
         ########################################################################
         if len(set(static_data_coords.values())) < len(static_data_coords):
             raise ValueError("Static data qubit positions must be unique.")
+        if any(coord < 0 for coords in static_data_coords.values() for coord in coords):
+            raise ValueError("Negative data coordinates not supported")
 
         if anc_basis_filter == 'X':
             anc_qubits = code.X_ancilla_indices
@@ -1054,16 +1040,6 @@ class UnitCellDevice:
                 distance_matrix = np.array([[distance(a, b) for a in [cur_coords] + coords_to_reach] for b in [cur_coords] + coords_to_reach])
                 distance_matrix[:, 0] = 0
                 permutation, _ = solve_tsp_dynamic_programming(distance_matrix)
-                # permutation = None
-                # best_distance = float('inf')
-                # for perm in itertools.permutations(range(1, len(coords_to_reach)+1)):
-                #     d = 0
-                #     perm_full = [0] + list(perm)
-                #     for i,idx in list(enumerate(perm_full))[1:]:
-                #         d += distance_matrix[perm_full[i-1], perm_full[i]]
-                #     if d < best_distance:
-                #         permutation = tuple(perm_full)
-                #         best_distance = d
                 tsp_results[key] = permutation
                 return permutation
 
@@ -1106,6 +1082,7 @@ class UnitCellDevice:
             def heuristic(state: State):
                 cur_task = state.cur_task
                 if isinstance(cur_task, int):
+                    # Fixed order of tasks
                     if cur_task == len(target_coords):
                         if state.component == DeviceComponent.READOUT:
                             if state.t_end - cost_to_node[state] >= self.hardware_params.measure_duration:
@@ -1129,6 +1106,7 @@ class UnitCellDevice:
                             cur = tgt
                         return cost
                 else:
+                    # Can choose order of tasks
                     if all(cur_task):
                         if state.component == DeviceComponent.READOUT:
                             if state.t_end - cost_to_node[state] >= self.hardware_params.measure_duration:
@@ -1164,6 +1142,8 @@ class UnitCellDevice:
         for anc in anc_qubits:
             data_qubits = ancilla_data_to_visit[anc]
             data_coords = [static_data_coords[data] for data in data_qubits]
+            if self.debug:
+                self.printd('Optimizing ancilla qubit', anc, 'on data qubits', data_qubits, 'at coordinates', data_coords)
             heuristic = get_heuristic(anc, data_qubits, data_coords)
             frontier = set() # TODO: can use min-heap or pqueue
             frontier_heap = []
@@ -1207,11 +1187,6 @@ class UnitCellDevice:
             }
             node_heuristic_vals = {s: heuristic(s) for s in frontier}
 
-            if self.debug:
-                self.printd('Start nodes:')
-                for state in start_states:
-                    self.printd(state)
-
             # self.printd(anc, (x,y), data_coords)
 
             def add_state(state: State, state_new: State, transition_cost: int):
@@ -1244,20 +1219,8 @@ class UnitCellDevice:
 
             found_solution = False
             while frontier:
-                # assert len(frontier) == len(frontier_heap)
-                # assert frontier == set(s for _,s in frontier_heap)
-                # state = min(frontier, key=lambda state: node_heuristic_vals[state])
                 _,state = heapq.heappop(frontier_heap)
-                # if node_heuristic_vals[state] != frontier_heap[0][0]:
-                #     print(node_heuristic_vals[state], frontier_heap[0][0])
-                #     print()
-                # assert node_heuristic_vals[state] == frontier_heap[0][0]
                 frontier.remove(state)
-                # frontier_heap.remove((node_heuristic_vals[state], state))
-                # heapq.heapify(frontier_heap)
-                # if heuristic(state) != frontier_heap[0][0]:
-                #     print(heuristic(state), frontier_heap[0][0])
-                # _,state = heapq.heappop(frontier_heap)
 
                 self.printd(f'POP {(state.x, state.y, str(state.component), state.cur_task)} with cost {node_heuristic_vals[state]} ({cost_to_node[state]} + {heuristic(state)})')
                 if node_heuristic_vals[state] - cost_to_node[state] == 0:
@@ -1349,8 +1312,6 @@ class UnitCellDevice:
 
                     found_solution = True
                     break
-                
-                # frontier.remove(state)
 
                 # Shuttling steps
                 if state.component == DeviceComponent.SHUTTLE_INTERSECTION:
