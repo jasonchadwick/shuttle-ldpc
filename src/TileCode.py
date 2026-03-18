@@ -25,6 +25,8 @@ class TileCode(QECCode):
             ((x1,y1),(x2,y2)) = edge
             # TODO
 
+        self._ancilla_coords = dict()
+
         self._bulk_nodes = set()
         self._Z_boundary_nodes = set()
         self._X_boundary_nodes = set()
@@ -121,6 +123,23 @@ class TileCode(QECCode):
         min_x = min(x for x,_ in self.qubit_coords)
         min_y = min(y for _,y in self.qubit_coords)
         self.qubit_coords = [(x-min_x,y-min_y) for (x,y) in self.qubit_coords]
+        self.ancilla_reference_positions = dict()
+        for i, X_node in enumerate(self._bulk_nodes + self._X_boundary_nodes):
+            assert len(X_check_edges[i]) == len(self.X_checks[i])
+            x0,y0 = X_node
+            x = x0+y0
+            y = x0-y0
+            u = x-y
+            v = (x+y+1)//2
+            self.ancilla_reference_positions[self.X_ancilla_indices[i]] = (u+min_x,v+min_y)
+        for i, Z_node in enumerate(self._bulk_nodes + self._Z_boundary_nodes):
+            assert len(Z_check_edges[i]) == len(self.Z_checks[i])
+            x0,y0 = Z_node
+            x = x0+y0
+            y = x0-y0
+            u = x-y
+            v = (x+y+1)//2
+            self.ancilla_reference_positions[self.Z_ancilla_indices[i]] = (u+min_x,v+min_y)
 
     def compute_code_parameters(self):
         return (self.num_data, self.k, -1)

@@ -95,6 +95,7 @@ class RotatedSurfaceCode(QECCode):
                     self.check_cx_layers[-1].append((dqi.idx, measure.idx))
 
         self.qubit_coords = [(q.coords[0], q.coords[1]) for q in self.all_qubits]
+        self.ancilla_reference_positions = [self.qubit_coords[a] for a in [q.idx for q in self.ancilla]]
 
         self.hz = np.array([[1 if q_idx in checks else 0 for q_idx in self.data_indices] for checks in self.Z_checks])
         self.hx = np.array([[1 if q_idx in checks else 0 for q_idx in self.data_indices] for checks in self.X_checks])
