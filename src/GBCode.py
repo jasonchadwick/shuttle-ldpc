@@ -1,4 +1,5 @@
 from qldpc import codes
+from qldpc.codes.common import CSSCode, ClassicalCode
 from qldpc.objects import Pauli
 from sympy.abc import x, y
 import numpy as np
@@ -50,4 +51,5 @@ class GBCode(QECCode):
         Lz = np.array(self.qldpc_code.get_logical_ops(Pauli.Z), dtype=bool)
         return Lx, Lz
         
-        
+    def to_qldpc_code_object(self) -> CSSCode:
+        return self.qldpc_code

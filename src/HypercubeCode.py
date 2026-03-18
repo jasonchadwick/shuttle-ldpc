@@ -9,6 +9,7 @@ class HypercubeCode(QECCode):
             self,
             r: int
         ):
+        self.r = r
         self.qldpc_code = codes.ManyHypercubeCode(r)
         self.num_data = self.qldpc_code.num_qubits
         self.data_indices = list(range(self.num_data))
@@ -22,15 +23,15 @@ class HypercubeCode(QECCode):
         self.Z_checks = [[int(x) for x in np.nonzero(Hz[a,:])[0]] for a in range(Hz.shape[0])]
 
         self.qubit_coords = []
-        m = np.sqrt(self.num_data)
+        m = int(np.sqrt(self.num_data))
         for i in range(self.num_data):
             self.qubit_coords.append((i % m, i // m))
 
-    def get_distance_bound(self, num_trials: int):
-        return self.qldpc_code.get_distance_bound(num_trials=num_trials)
-    
+        assert self.num_data == 6**self.r
+        assert self.qldpc_code.dimension == 4**self.r
+
     def compute_code_parameters(self, distance_bound_num_trials: int = 100):
-        return (self.num_data, self.qldpc_code.dimension, self.get_distance_bound(distance_bound_num_trials))
+        return (self.num_data, self.qldpc_code.dimension, 2**self.r)
 
     def compute_logical_operators(self):
         Lx = np.array(self.qldpc_code.get_logical_ops(Pauli.X), dtype=bool)

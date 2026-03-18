@@ -1,6 +1,7 @@
 """Parent class for quantum error correcting codes."""
 import numpy as np
 from numpy.typing import NDArray
+from qldpc.codes.common import CSSCode, ClassicalCode
 
 class QECCode:
     num_data: int
@@ -22,7 +23,7 @@ class QECCode:
     # Can be defined for easier visualization of the code layout, but does not
     # change simulation results.
     qubit_coords: list[tuple[int, int]] = []
-
+    ancilla_reference_positions: dict[int, tuple[int, int]] = dict()
     check_cx_layers: list[list[tuple[int, int]]] = []
 
     def compute_code_parameters(self):
@@ -168,6 +169,12 @@ class QECCode:
             
         # The first r rows now form our conjugate logical operator pairs
         return Kx[:r], Kz[:r], r
+    
+    def to_qldpc_code_object(self) -> CSSCode:
+        return CSSCode(
+            ClassicalCode(self.get_Hx()),
+            ClassicalCode(self.get_Hz()),
+        )
 
 class TestCode(QECCode):
     # Data qubits are in a grid, X checks are along cols, Z checks are along
