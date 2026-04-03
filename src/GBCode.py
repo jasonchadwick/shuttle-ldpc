@@ -27,14 +27,14 @@ class GBCode(QECCode):
         self.qldpc_code = codes.BBCode(orders, poly_a, poly_b)
         self.num_data = self.qldpc_code.num_qubits
         self.data_indices = list(range(self.num_data))
-        Hx = self.qldpc_code.get_matrix(Pauli.X)
-        Hz = self.qldpc_code.get_matrix(Pauli.Z)
-        num_X = Hx.shape[0]
-        num_Z = Hz.shape[0]
+        self.Hx = self.qldpc_code.get_matrix(Pauli.X)
+        self.Hz = self.qldpc_code.get_matrix(Pauli.Z)
+        num_X = self.Hx.shape[0]
+        num_Z = self.Hz.shape[0]
         self.X_ancilla_indices = list(range(self.num_data, self.num_data + num_X))
         self.Z_ancilla_indices = list(range(self.num_data + num_X, self.num_data + num_X + num_Z))
-        self.X_checks = [[int(x) for x in np.nonzero(Hx[a,:])[0]] for a in range(Hx.shape[0])]
-        self.Z_checks = [[int(x) for x in np.nonzero(Hz[a,:])[0]] for a in range(Hz.shape[0])]
+        self.X_checks = [[int(x) for x in np.nonzero(self.Hx[a,:])[0]] for a in range(self.Hx.shape[0])]
+        self.Z_checks = [[int(x) for x in np.nonzero(self.Hz[a,:])[0]] for a in range(self.Hz.shape[0])]
 
         self.qubit_coords = []
         for i in range(self.num_data):

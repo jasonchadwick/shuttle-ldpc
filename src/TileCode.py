@@ -182,6 +182,13 @@ class TileCode(QECCode):
             plt.plot(x, y, 'o', color='k')
         plt.show()
     
+    def _optimize_SE_circuit(self, X_anc_idx=0, Z_anc_idx=0):
+        X_checks = self.X_checks[X_anc_idx]
+        Z_checks = self.Z_checks[Z_anc_idx]
+        # Key principle: single fault on ancilla qubit should not propagate to
+        # two data qubit faults along the same logical operator. Unless the
+        # correction is easy and would complete a stabilizer...
+    
     @classmethod
     def known_code(cls, n, k, d):
         # From Table I of arXiv:2504.09171

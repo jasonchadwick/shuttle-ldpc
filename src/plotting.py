@@ -54,12 +54,13 @@ def plot_device_snapshot(
         y = int(round(coords[1]))
         coords = (x,y)
         if coords not in seen_coords:
-            ax.add_patch(mpl.patches.Rectangle((x-0.25, y-0.45), 0.2, 0.4, edgecolor='C2', facecolor='none', linewidth=2, zorder=3))
+            ax.add_patch(mpl.patches.Rectangle((x-0.3, y-0.5), 0.3, 0.5, edgecolor='none', facecolor='C2', alpha=0.5, zorder=3))
+            ax.add_patch(mpl.patches.Rectangle((x-0.3, y-0.5), 0.3, 0.5, edgecolor='C2', facecolor='none', linewidth=2, zorder=3))
         seen_coords.add(coords)
 
     ax.set_xlim(-2, dev.w)
     ax.set_ylim(-2, dev.h)
-    ax.set_title(f't={frame.t}')
+    ax.set_title(f't={frame.t}ns')
     ax.set_axis_off()
     ax.set_aspect('equal')
     return ax
@@ -90,7 +91,8 @@ def plot_transition(
             y = int(round(coords[1]))
             coords = (x,y)
             if coords not in seen_coords:
-                ax.add_patch(mpl.patches.Rectangle((x-0.25, y-0.45), 0.2, 0.4, edgecolor='C2', facecolor='none', linewidth=2, zorder=3))
+                ax.add_patch(mpl.patches.Rectangle((x-0.3, y-0.5), 0.3, 0.5, edgecolor='none', facecolor='C2', alpha=0.5, zorder=3))
+                ax.add_patch(mpl.patches.Rectangle((x-0.3, y-0.5), 0.3, 0.5, edgecolor='C2', facecolor='none', linewidth=2, zorder=3))
             seen_coords.add(coords)
 
     if not highlight_qubits:

@@ -56,7 +56,7 @@ def error_params(
     return ErrorParams(
         T2=T2,
         cx_err=p,
-        h_err=p,
+        h_err=p/10,
         shuttle_err=p_sh,
         emplace_err=p_sh/10,
         init_err=p,
@@ -655,7 +655,7 @@ class ScheduleMetrics:
     qubit_idle_durations: dict[int, int]
     qubit_distance_traveled: dict[int, int]
     avg_qubit_idle_frac: float
-    # avg_distance_traveled: float
+    avg_distance_traveled: float
 
     def __init__(self, schedule: CompiledShuttlingSchedule):
         self.qubit_active_durations = dict()
@@ -684,7 +684,7 @@ class ScheduleMetrics:
                     self.qubit_idle_durations[q] = self.qubit_idle_durations.get(q, 0) + start_time - qubit_last_active[q]
                 qubit_last_active[q] = start_time + instr.duration
         self.avg_qubit_idle_frac = float(np.mean([d/self.qubit_active_durations[q] for q,d in self.qubit_idle_durations.items() if q in self.qubit_distance_traveled]))
-        self.avg_distance_traveled = float(np.mean([d for d in self.qubit_distance_traveled.items()]))
+        self.avg_distance_traveled = float(np.mean(list(self.qubit_distance_traveled.values())))
 
 class SchedulingMethod(Enum):
     GREEDY = 'GREEDY' # no lookahead, schedule a shuttle one edge at a time
@@ -741,6 +741,7 @@ class UnitCellDevice:
         self.debug = debug
         self.all_coords = [(x,y) for x in range(self.w) for y in range(self.h)]
         self.all_edges = [sort((c0, c1)) for c0 in self.all_coords for c1 in self.all_coords if c0 != c1]
+        self.broken_edges = []
 
     def _schedule_cache_dir(self, cache_dir: str | Path | None = None) -> Path:
         if cache_dir is None:
@@ -805,6 +806,7 @@ class UnitCellDevice:
             use_cache: bool = True,
             force_overwrite_cache: bool = False,
             cache_dir: str | Path | None = '.scheduler_cache',
+            suppress_printing: bool = False,
         ):
         schedule = CompiledShuttlingSchedule(sorted(list(static_data_coords.keys())), sorted(list(static_data_coords.keys())))
         schedule.append_instr(
@@ -838,6 +840,7 @@ class UnitCellDevice:
             use_cache=use_cache,
             force_overwrite_cache=force_overwrite_cache,
             cache_dir=cache_dir,
+            suppress_printing=suppress_printing,
         )
         schedule += rounds * SE_sched
         t = schedule.total_duration()
@@ -874,6 +877,7 @@ class UnitCellDevice:
             use_cache: bool = False,
             force_overwrite_cache: bool = False,
             cache_dir: str | Path | None = None,
+            suppress_printing: bool = False,
         ) -> CompiledShuttlingSchedule:
         schedule = None
         cache_path = None
@@ -918,6 +922,7 @@ class UnitCellDevice:
                 anc_basis_filter='X',
                 buffer_time=buffer_time,
                 debug_qubit=debug_qubit,
+                suppress_printing=suppress_printing,
             )
             schedule = schedule_fn(
                 code=code,
@@ -930,6 +935,7 @@ class UnitCellDevice:
                 prior_schedule=X_sched,
                 allow_interleave_with_prior=False,
                 debug_qubit=debug_qubit,
+                suppress_printing=suppress_printing,
             )
         else:
             schedule = schedule_fn(
@@ -940,6 +946,7 @@ class UnitCellDevice:
                 refocus_shuttle_noise=refocus_shuttle_noise,
                 buffer_time=buffer_time,
                 debug_qubit=debug_qubit,
+                suppress_printing=suppress_printing,
             )
 
         if use_cache and cache_path is not None:
@@ -966,6 +973,7 @@ class UnitCellDevice:
             prior_schedule: CompiledShuttlingSchedule | None = None,
             allow_interleave_with_prior: bool = False,
             debug_qubit: int | None = None,
+            suppress_printing: bool = False,
         ) -> CompiledShuttlingSchedule:
         """Compile a shuttling schedule for a syndrome extraction round. Assumes
         data qubits are already initialized and fixed in place within each unit
@@ -1163,7 +1171,7 @@ class UnitCellDevice:
         ########################################################################
         # Optimization loop - for each ancilla
         ########################################################################
-        if not self.debug:
+        if not self.debug and not suppress_printing:
             print(f'Optimizing {len(anc_qubits)} ancilla schedules', end='')
         for anc in anc_qubits:
             data_qubits = ancilla_data_to_visit[anc]
@@ -1346,6 +1354,8 @@ class UnitCellDevice:
                         if not (0 <= new_x < self.w and 0 <= new_y < self.h):
                             continue
                         shuttle_edge = sort(((state.x, state.y), (new_x,new_y)))
+                        if shuttle_edge in self.broken_edges:
+                            continue
                         for (edge_start, edge_end) in edge_safe_intervals[shuttle_edge]:
                             earliest_start = max(edge_start, cost_to_node[state])
                             latest_end = min(edge_end, state.t_end + self.hardware_params.shuttle_duration)
@@ -1420,9 +1430,9 @@ class UnitCellDevice:
                             add_state(state, state_new, transition_cost=get_cx_duration(anc, state.cur_task, len(data_coords)))
             if not found_solution:
                 raise RuntimeError(f'Unable to find solution for qubit {anc}')
-            if not self.debug:
+            if not self.debug and not suppress_printing:
                 print('.', end='')
-        if not self.debug:
+        if not self.debug and not suppress_printing:
             print()
 
         return schedule
@@ -1439,6 +1449,7 @@ class UnitCellDevice:
             prior_schedule: CompiledShuttlingSchedule | None = None,
             allow_interleave_with_prior: bool = False,
             debug_qubit: int | None = None,
+            suppress_printing: bool = False,
         ) -> CompiledShuttlingSchedule:
         """Compile a shuttling schedule for a syndrome extraction round. Assumes
         data qubits are already initialized and fixed in place within each unit
@@ -1912,7 +1923,8 @@ class UnitCellDevice:
         if not found_solution:
             raise RuntimeError(f'Unable to find solution for qubit {hero_anc}')
         
-        print('Solved tiled solution!')
+        if not suppress_printing:
+            print('Solved tiled solution!')
 
         ########################################################################
         # Copying schedule to the rest of the ancilla qubits
