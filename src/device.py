@@ -330,8 +330,15 @@ class CompiledShuttlingSchedule:
 
         return frames
 
-    def to_stim_circuit(self, code: QECCode, basis: str, error_params: ErrorParams, XYZ_decode: bool = False) -> stim.Circuit:
-        """Convert the compiled shuttling schedule back into a Stim circuit."""
+    def to_stim_circuit(self, code: QECCode, basis: str, error_params: ErrorParams, XYZ_decode: bool = False,
+                        strict_idle: bool = False) -> stim.Circuit:
+        """Convert the compiled shuttling schedule back into a Stim circuit.
+
+        strict_idle: charge the idle error of every qubit before every instruction it waits for. With
+        the default (False), idle errors are only added at the first instruction of each new start
+        time, so qubits whose next instruction shares its start time with an earlier instruction
+        never receive their idle error. strict_idle also uses the pure-dephasing probability
+        (1 - exp(-t/T2)) / 2 in place of 1 - exp(-t/T2)."""
         circ = stim.Circuit()
 
         if hasattr(code, 'qubit_coords'):
@@ -349,12 +356,15 @@ class CompiledShuttlingSchedule:
         meas_basis_change = False
         for instr_idx, (instr, start_time) in enumerate(zip(instructions, instruction_start_times)):
             # apply idle errors
-            if not isinstance(instr, Instantiate) and start_time > last_start_time:
+            if not isinstance(instr, Instantiate) and (strict_idle or start_time > last_start_time):
                 idle_ops: dict[float, list[int]] = dict()
                 for q in instr.qubits_list():
                     if qubit_time_last_used[q] < start_time:
                         idle_time = start_time - qubit_time_last_used[q]
-                        idle_err = 1 - np.exp(-idle_time*1e-9 / error_params.T2)
+                        if strict_idle:
+                            idle_err = (1 - np.exp(-idle_time*1e-9 / error_params.T2)) / 2
+                        else:
+                            idle_err = 1 - np.exp(-idle_time*1e-9 / error_params.T2)
                         idle_ops.setdefault(idle_err, []).append(q)
                 for idle_err, qs in idle_ops.items():
                     circ.append('Z_ERROR', qs, min(0.75, idle_err))
@@ -446,8 +456,11 @@ class CompiledShuttlingSchedule:
 
         return circ
     
-    def to_stim_circuit_simple(self, code: QECCode, basis: str, error_params: ErrorParams) -> stim.Circuit:
-        """Convert the compiled shuttling schedule back into a Stim circuit."""
+    def to_stim_circuit_simple(self, code: QECCode, basis: str, error_params: ErrorParams,
+                               strict_idle: bool = False) -> stim.Circuit:
+        """Convert the compiled shuttling schedule back into a Stim circuit.
+
+        strict_idle: see to_stim_circuit."""
         circ = stim.Circuit()
 
         if hasattr(code, 'qubit_coords'):
@@ -469,12 +482,15 @@ class CompiledShuttlingSchedule:
         last_start_time = 0
         for instr, start_time in zip(instructions, instruction_start_times):
             # apply idle errors
-            if not isinstance(instr, Instantiate) and start_time > last_start_time:
+            if not isinstance(instr, Instantiate) and (strict_idle or start_time > last_start_time):
                 idle_ops: dict[float, list[int]] = dict()
                 for q in instr.qubits_list():
                     if qubit_time_last_used[q] < start_time:
                         idle_time = start_time - qubit_time_last_used[q]
-                        idle_err = 1 - np.exp(-idle_time*1e-9 / error_params.T2)
+                        if strict_idle:
+                            idle_err = (1 - np.exp(-idle_time*1e-9 / error_params.T2)) / 2
+                        else:
+                            idle_err = 1 - np.exp(-idle_time*1e-9 / error_params.T2)
                         idle_ops.setdefault(idle_err, []).append(q)
                 for idle_err, qs in idle_ops.items():
                     circ.append('Z_ERROR', qs, min(0.75, idle_err))
